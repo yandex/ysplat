@@ -443,7 +443,10 @@ def rasterization(
             The input Gaussians are expected to be a subset of scene in each rank, and
             the function will collaboratively render the images for all ranks.
         camera_model: The camera model to use. Supported models are "pinhole", "ortho",
-            "fisheye", and "ftheta". Default is "pinhole".
+            "fisheye", "ftheta", and "spherical". The spherical model is
+            equirectangular and requires ``with_ut=True``, ``with_eval3d=True``,
+            ``global_z_order=False``, and no distortion coefficients. Default is
+            "pinhole".
         segmented: Whether to use segmented radix sort. Default is False.
             Segmented radix sort performs sorting in segments, which is more efficient for the sorting operation itself.
             However, since it requires offset indices as input, additional global memory access is needed, which results
@@ -518,6 +521,27 @@ def rasterization(
 
     """
     has_color = render_mode_has_color(render_mode)
+
+    if camera_model == "spherical":
+        if not (with_ut and with_eval3d):
+            raise ValueError(
+                "camera_model='spherical' requires with_ut=True and with_eval3d=True"
+            )
+        if global_z_order:
+            raise ValueError("camera_model='spherical' requires global_z_order=False")
+        if any(
+            value is not None
+            for value in (
+                radial_coeffs,
+                tangential_coeffs,
+                thin_prism_coeffs,
+                ftheta_coeffs,
+                external_distortion_coeffs,
+            )
+        ):
+            raise ValueError(
+                "camera_model='spherical' does not support camera distortion"
+            )
 
     external_distortion_coeffs = cast(
         Optional[BivariateWindshieldModelParameters], external_distortion_coeffs

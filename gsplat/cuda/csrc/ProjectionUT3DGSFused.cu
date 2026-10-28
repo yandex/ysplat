@@ -369,6 +369,14 @@ void launch_projection_ut_3dgs_fused_kernel(
                 )
             );
         }
+        else if(camera_model == CameraModelType::SPHERICAL)
+        {
+            return to_sensor_model_kernel_params(
+                get_camera_model_kernel_params<SphericalCameraModel>(
+                    {image_width, image_height}, rs_type, external_distortion_kernel_params, Ks.const_data_ptr<float>()
+                )
+            );
+        }
         else if(camera_model == CameraModelType::FTHETA)
         {
             TORCH_CHECK(ftheta_coeffs.has_value(), "ftheta coefficients must be given for ftheta camera model");
@@ -391,7 +399,8 @@ void launch_projection_ut_3dgs_fused_kernel(
         {
             TORCH_CHECK(
                 false,
-                "Invalid camera model: only pinhole, ortho, fisheye, ftheta, and lidar camera models are supported"
+                "Invalid camera model: only pinhole, ortho, fisheye, ftheta, spherical, and lidar camera models are "
+                "supported"
             );
         }
     }();

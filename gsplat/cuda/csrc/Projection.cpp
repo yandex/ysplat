@@ -2009,6 +2009,17 @@ ProjectionUT3DGSFusedResult projection_ut_3dgs_fused_impl(
                 "ortho camera model does not support radial_coeffs, tangential_coeffs, or thin_prism_coeffs parameters"
             );
         }
+        if(camera_model == CameraModelType::SPHERICAL)
+        {
+            TORCH_CHECK(
+                !radial_coeffs.has_value()
+                    && !tangential_coeffs.has_value()
+                    && !thin_prism_coeffs.has_value()
+                    && !external_distortion_params.has_value(),
+                "spherical camera model does not support camera distortion"
+            );
+            TORCH_CHECK(!global_z_order, "spherical camera model requires global_z_order=False");
+        }
         if(radial_coeffs.has_value())
         {
             const at::Tensor &radial = radial_coeffs.value();

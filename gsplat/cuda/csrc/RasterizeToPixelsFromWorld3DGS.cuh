@@ -473,6 +473,18 @@ __device__ __forceinline__ WorldRay compute_world_ray(
                 ray = camera_model.element_to_world_ray_shutter_pose(j, i, rs_params);
             }
         }
+        else if(camera_model_type == CameraModelType::SPHERICAL)
+        {
+            // Spherical MVP deliberately excludes external distortion.
+            assert(!external_distortion_device_params.has_value());
+            using CameraModel = SphericalCameraModel<extdist::EmptyExternalDistortionModel>;
+            CameraModel::KernelParameters kernel_params = {
+                {{image_width, image_height}, rs_type, {}},
+                Ks,
+            };
+            CameraModel camera_model(kernel_params, iid);
+            ray = camera_model.element_to_world_ray_shutter_pose(j, i, rs_params);
+        }
         else if(camera_model_type == CameraModelType::FTHETA)
         {
             if(external_distortion_device_params.has_value())

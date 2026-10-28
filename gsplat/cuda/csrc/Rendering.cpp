@@ -233,7 +233,8 @@ namespace
             }
         }
 
-        const bool is_lidar_camera = camera_model == CameraModelType::LIDAR;
+        const bool is_lidar_camera     = camera_model == CameraModelType::LIDAR;
+        const bool is_spherical_camera = camera_model == CameraModelType::SPHERICAL;
         TORCH_CHECK(
             has_color || append_depth,
             "Unsupported render_mode. Expected one of RGB, d, Ed, D, ED, "
@@ -248,6 +249,19 @@ namespace
             "Antialiased rasterization is only supported for classic 3DGS"
         );
         TORCH_CHECK(global_z_order || with_ut, "global_z_order can be false only if with_ut=True");
+        TORCH_CHECK(
+            !is_spherical_camera || (with_ut && with_eval3d),
+            "spherical camera model requires with_ut=True and with_eval3d=True"
+        );
+        TORCH_CHECK(!is_spherical_camera || !global_z_order, "spherical camera model requires global_z_order=False");
+        TORCH_CHECK(
+            !is_spherical_camera
+                || (!radial_coeffs.has_value()
+                    && !tangential_coeffs.has_value()
+                    && !thin_prism_coeffs.has_value()
+                    && !external_distortion_params.has_value()),
+            "spherical camera model does not support camera distortion"
+        );
         TORCH_CHECK(
             with_ut || camera_model != CameraModelType::FTHETA,
             "ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"

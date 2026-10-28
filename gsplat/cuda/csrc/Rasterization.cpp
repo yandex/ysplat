@@ -2588,6 +2588,16 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
             rays.value().scalar_type() == at::kFloat, "rays must be torch.float32, got ", rays.value().scalar_type()
         );
     }
+    if(camera_model == CameraModelType::SPHERICAL)
+    {
+        TORCH_CHECK_VALUE(
+            !radial_coeffs.has_value()
+                && !tangential_coeffs.has_value()
+                && !thin_prism_coeffs.has_value()
+                && !external_distortion_params.has_value(),
+            "spherical camera model does not support camera distortion"
+        );
+    }
 
     TORCH_CHECK_VALUE(
         tile_size == 8u || tile_size == 16u, "3DGUT rasterization requires tile_size in (8, 16), got ", tile_size

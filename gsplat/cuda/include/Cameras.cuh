@@ -725,6 +725,79 @@ struct PerfectPinholeCameraModel
     }
 };
 
+// Equirectangular camera model using OpenCV camera axes (+X right, +Y down,
+// +Z forward). Focal lengths are pixels per radian and the principal point is
+// the zero-longitude / zero-latitude image coordinate.
+template<typename ExternalDistortionModel>
+struct SphericalCameraModel
+    : BaseCameraModel<SphericalCameraModel<ExternalDistortionModel>, ExternalDistortionModel>
+{
+    using Base = BaseCameraModel<SphericalCameraModel<ExternalDistortionModel>, ExternalDistortionModel>;
+
+    struct KernelParameters : Base::KernelParameters
+    {
+        const float *__restrict__ Ks;
+    };
+
+    struct Parameters : Base::Parameters
+    {
+        std::array<float, 2> principal_point;
+        std::array<float, 2> focal_length;
+
+        inline __device__ Parameters(const KernelParameters &kernel_parameters, int camera_index)
+            : Base::Parameters(kernel_parameters, camera_index)
+            , principal_point({kernel_parameters.Ks[camera_index * 9 + 2], kernel_parameters.Ks[camera_index * 9 + 5]})
+            , focal_length({kernel_parameters.Ks[camera_index * 9 + 0], kernel_parameters.Ks[camera_index * 9 + 4]})
+        {
+        }
+    };
+
+    inline __device__ SphericalCameraModel(const KernelParameters &kernel_parameters, int camera_index)
+        : parameters(kernel_parameters, camera_index)
+    {
+    }
+
+    Parameters parameters;
+
+    inline __device__ auto camera_ray_to_image_point_impl(const glm::fvec3 &cam_ray, float margin_factor) const ->
+        typename Base::ImagePointReturn
+    {
+        const float horizontal_norm = numerically_stable_norm2(cam_ray.x, cam_ray.z);
+        const float ray_norm        = numerically_stable_norm2(horizontal_norm, cam_ray.y);
+        if(ray_norm <= std::numeric_limits<float>::epsilon())
+        {
+            return {{0.f, 0.f}, false};
+        }
+
+        const float longitude = atan2f(cam_ray.x, cam_ray.z);
+        const float latitude  = atan2f(cam_ray.y, horizontal_norm);
+        const glm::fvec2 image_point = {
+            parameters.focal_length[0] * longitude + parameters.principal_point[0],
+            parameters.focal_length[1] * latitude + parameters.principal_point[1]
+        };
+        return {
+            image_point,
+            image_point_in_image_bounds_margin(image_point, parameters.resolution, margin_factor)
+        };
+    }
+
+    inline __device__ CameraRay image_point_to_camera_ray_impl(glm::fvec2 image_point) const
+    {
+        const glm::fvec2 angles
+            = (image_point - glm::fvec2{parameters.principal_point[0], parameters.principal_point[1]})
+            / glm::fvec2{parameters.focal_length[0], parameters.focal_length[1]};
+        const float longitude = angles.x;
+        const float latitude  = angles.y;
+        const float cos_lat   = cosf(latitude);
+        const glm::fvec3 ray = {
+            sinf(longitude) * cos_lat,
+            sinf(latitude),
+            cosf(longitude) * cos_lat
+        };
+        return {ray / glm::length(ray), true};
+    }
+};
+
 template<typename ExternalDistortionModel>
 struct OrthographicCameraModel
     : BaseCameraModel<OrthographicCameraModel<ExternalDistortionModel>, ExternalDistortionModel>
@@ -1952,7 +2025,8 @@ using CameraModelWrappers = TypeList<
     CameraModelWrapper<OrthographicCameraModel>,
     CameraModelWrapper<OpenCVPinholeCameraModel>,
     CameraModelWrapper<OpenCVFisheyeCameraModel>,
-    CameraModelWrapper<FThetaCameraModel>
+    CameraModelWrapper<FThetaCameraModel>,
+    CameraModelWrapper<SphericalCameraModel>
 >;
 
 // All camera model types: every camera instantiated with every distortion model.

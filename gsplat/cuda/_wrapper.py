@@ -35,7 +35,7 @@ from gsplat.cuda._lidar import (
 )
 
 ExternalDistortionModelMeta = Literal["bivariate-windshield"]
-CameraModel = Literal["pinhole", "ortho", "fisheye", "ftheta", "lidar"]
+CameraModel = Literal["pinhole", "ortho", "fisheye", "ftheta", "spherical", "lidar"]
 
 # Autograd for the migrated ops is attached in Python (torch.library.register_autograd)
 # rather than C++. The C++ module exports only each op's `<op>_fwd` and `<op>_bwd`; the
@@ -2316,6 +2316,17 @@ def rasterize_to_pixels_eval3d(
     """
     if ut_params is None:
         ut_params = UnscentedTransformParameters()
+    if camera_model == "spherical" and any(
+        value is not None
+        for value in (
+            radial_coeffs,
+            tangential_coeffs,
+            thin_prism_coeffs,
+            ftheta_coeffs,
+            external_distortion_coeffs,
+        )
+    ):
+        raise ValueError("camera_model='spherical' does not support camera distortion")
 
     colors, alphas, *_ = rasterize_to_pixels_eval3d_extra(
         means=means,
@@ -2585,6 +2596,22 @@ def fully_fused_projection_with_ut(
             faster and sufficient for most cases, while Euclidean distance can be useful for scenes
             with wide field-of-view or non-standard camera models. Default: True.
     """
+    if camera_model == "spherical":
+        if global_z_order:
+            raise ValueError("camera_model='spherical' requires global_z_order=False")
+        if any(
+            value is not None
+            for value in (
+                radial_coeffs,
+                tangential_coeffs,
+                thin_prism_coeffs,
+                ftheta_coeffs,
+                external_distortion_coeffs,
+            )
+        ):
+            raise ValueError(
+                "camera_model='spherical' does not support camera distortion"
+            )
     if lidar_coeffs is not None:
         assert isinstance(
             lidar_coeffs, RowOffsetStructuredSpinningLidarModelParametersExt
