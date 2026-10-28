@@ -2398,7 +2398,8 @@ def rasterize_to_pixels_eval3d_extra(
     renderer_config: Any = None,
     return_last_ids: bool = True,
     unsafe_masked_tile_outputs: bool = False,
-) -> Tuple[Tensor, Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
+    return_depth_dispersion: bool = False,
+) -> Tuple:
     """Rasterizes Gaussians to pixels, returning extra information for debugging.
 
     Similar to `rasterize_to_pixels_eval3d()`, but can return the last gaussian id
@@ -2423,6 +2424,12 @@ def rasterize_to_pixels_eval3d_extra(
             values for masked tiles: render_colors = backgrounds (or 0.0 when no
             backgrounds are provided), render_alphas = 0.0, render_normals = 0.0,
             last_ids = -1, sample_counts = 0.
+        return_depth_dispersion: Append a differentiable ``[..., C, H, W, 4]``
+            tensor containing the unnormalized linear sums ``sum(w*z)``,
+            ``sum(w*z**2)``, ``sum(w*log(z))``, and
+            ``sum(w*log(z)**2)``. The corresponding weight sum is returned in
+            ``render_alphas``. An exact zero distance is clamped to the
+            smallest positive float for the logarithm.
 
     Returns:
         A tuple (contents depend on return flags):
@@ -2455,6 +2462,7 @@ def rasterize_to_pixels_eval3d_extra(
         last_ids,
         sample_counts,
         render_normals,
+        depth_moments,
     ) = _make_lazy_cuda_func("rasterize_to_pixels_from_world_3dgs")(
         means.contiguous(),
         quats.contiguous(),
@@ -2488,9 +2496,13 @@ def rasterize_to_pixels_eval3d_extra(
         renderer_config,
         return_last_ids,
         unsafe_masked_tile_outputs,
+        return_depth_dispersion,
     )
 
-    return render_colors, render_alphas, last_ids, sample_counts, render_normals
+    outputs = (render_colors, render_alphas, last_ids, sample_counts, render_normals)
+    if return_depth_dispersion:
+        outputs += (depth_moments,)
+    return outputs
 
 
 @torch.no_grad()

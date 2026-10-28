@@ -46,6 +46,7 @@ struct Rasterization3DGSResult
     at::Tensor render_alphas;
     at::Tensor render_extra_signals;
     at::Tensor render_normals;
+    at::Tensor render_depth_moments;
     at::Tensor means2d_absgrad;
     at::Tensor batch_ids;
     at::Tensor camera_ids;
@@ -73,6 +74,7 @@ struct TorchArgDef<Rasterization3DGSResult>
             r.render_alphas,
             r.render_extra_signals,
             r.render_normals,
+            r.render_depth_moments,
             r.means2d_absgrad,
             r.batch_ids,
             r.camera_ids,
@@ -130,6 +132,7 @@ namespace
         bool with_ut,
         ShutterType rolling_shutter,
         bool global_z_order,
+        bool return_depth_dispersion,
         bool use_hit_distance,
         bool return_normals,
         bool distributed
@@ -249,6 +252,10 @@ namespace
             "Antialiased rasterization is only supported for classic 3DGS"
         );
         TORCH_CHECK(global_z_order || with_ut, "global_z_order can be false only if with_ut=True");
+        TORCH_CHECK(
+            !return_depth_dispersion || with_eval3d,
+            "return_depth_dispersion=True requires with_eval3d=True"
+        );
         TORCH_CHECK(
             !is_spherical_camera || (with_ut && with_eval3d),
             "spherical camera model requires with_ut=True and with_eval3d=True"
@@ -800,6 +807,7 @@ Rasterization3DGSResult rasterization_3dgs(
     const at::optional<c10::intrusive_ptr<RowOffsetStructuredSpinningLidarModelParametersExt>> &lidar_coeffs,
     const at::optional<c10::intrusive_ptr<extdist::BivariateWindshieldModelParameters>> &external_distortion_params,
     bool global_z_order,
+    bool return_depth_dispersion,
     bool use_hit_distance,
     bool return_normals,
     int64_t renderer_config,
@@ -850,6 +858,7 @@ Rasterization3DGSResult rasterization_3dgs(
         with_ut,
         rolling_shutter,
         global_z_order,
+        return_depth_dispersion,
         use_hit_distance,
         return_normals,
         distributed
@@ -1360,6 +1369,7 @@ Rasterization3DGSResult rasterization_3dgs(
     std::vector<at::Tensor> render_color_chunks;
     at::Tensor render_alphas;
     at::Tensor render_normals = at::empty({0}, means.options());
+    at::Tensor render_depth_moments = at::empty({0}, means.options().dtype(at::kFloat));
     at::Tensor absgrad_holder;
     at::Tensor raster_isect_offsets = isect_offsets.contiguous();
     at::Tensor raster_flatten_ids   = isects.flatten_ids.contiguous();
@@ -1408,7 +1418,8 @@ Rasterization3DGSResult rasterization_3dgs(
                 return_normals && start == 0,
                 renderer_config,
                 false, // return_last_ids
-                false  // unsafe_masked_tile_outputs (safe default: masked tiles write defined outputs)
+                false, // unsafe_masked_tile_outputs (safe default: masked tiles write defined outputs)
+                return_depth_dispersion && start == 0
             );
             render_color_chunks.push_back(raster.renders);
             if(!render_alphas.defined())
@@ -1418,6 +1429,10 @@ Rasterization3DGSResult rasterization_3dgs(
             if(return_normals && start == 0 && raster.normals.has_value())
             {
                 render_normals = raster.normals.value();
+            }
+            if(start == 0 && raster.depth_moments.has_value())
+            {
+                render_depth_moments = raster.depth_moments.value();
             }
         }
 #    if GSPLAT_BUILD_3DGS
@@ -1484,6 +1499,7 @@ Rasterization3DGSResult rasterization_3dgs(
     result.render_alphas        = render_alphas;
     result.render_extra_signals = render_extra_signals;
     result.render_normals       = render_normals;
+    result.render_depth_moments = render_depth_moments;
     result.means2d_absgrad      = absgrad_holder;
     result.tiles_per_gauss      = isects.tiles_per_gauss;
     result.isect_ids            = isects.isect_ids;

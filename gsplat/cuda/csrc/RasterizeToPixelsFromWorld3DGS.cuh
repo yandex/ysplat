@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include <cfloat>
 #include <cuda/std/optional>
 
 #include "Common.h"
@@ -683,7 +684,11 @@ __device__ __forceinline__ void process_fetch_round_blend(
     vec3 (&normal_out)[PIXELS_PER_THREAD_T],
     int32_t (&cur_idx)[PIXELS_PER_THREAD_T],
     int32_t (&n_accumulated)[PIXELS_PER_THREAD_T],
-    uint32_t &done_mask
+    uint32_t &done_mask,
+    float *__restrict__ depth_first_moment,
+    float *__restrict__ depth_second_moment,
+    float *__restrict__ log_depth_first_moment,
+    float *__restrict__ log_depth_second_moment
 )
 {
     constexpr bool store_post_saturation_t   = SaturationPolicy == SaturationTPolicy::StorePostSaturationT;
@@ -730,6 +735,11 @@ __device__ __forceinline__ void process_fetch_round_blend(
                 const vec3 grds = scale * (grd * hit_t);
                 hit_distance    = glm::length(grds);
             }
+            else if(depth_first_moment != nullptr)
+            {
+                const vec3 grds = scale * (grd * hit_t);
+                hit_distance    = glm::length(grds);
+            }
 
             const float next_T = T[p] * (1.0f - alpha);
             if constexpr(CHECK_THRESHOLD)
@@ -753,6 +763,16 @@ __device__ __forceinline__ void process_fetch_round_blend(
             const float vis    = alpha * T[p];
             const float *c_ptr = colors + isect_id * CDIM;
 
+            if(depth_first_moment != nullptr)
+            {
+                // Keep CUDA output linear. PyTorch closes the moments into
+                // normalized and unnormalized pairwise dispersions.
+                const float log_hit_distance = __logf(fmaxf(hit_distance, FLT_MIN));
+                depth_first_moment[p] += vis * hit_distance;
+                depth_second_moment[p] += vis * hit_distance * hit_distance;
+                log_depth_first_moment[p] += vis * log_hit_distance;
+                log_depth_second_moment[p] += vis * log_hit_distance * log_hit_distance;
+            }
             if constexpr(UseHitDistance)
             {
 #pragma unroll
@@ -842,7 +862,11 @@ __device__ __forceinline__ bool process_logical_batch_gaussians(
     vec3 (&normal_out)[PIXELS_PER_THREAD_T],
     int32_t (&cur_idx)[PIXELS_PER_THREAD_T],
     int32_t (&n_accumulated)[PIXELS_PER_THREAD_T],
-    uint32_t &done_mask
+    uint32_t &done_mask,
+    float *__restrict__ depth_first_moment,
+    float *__restrict__ depth_second_moment,
+    float *__restrict__ log_depth_first_moment,
+    float *__restrict__ log_depth_second_moment
 )
 {
     static_assert(LOGICAL_BATCH_T % FETCH_SIZE_T == 0, "LOGICAL_BATCH_T must be a multiple of FETCH_SIZE_T");
@@ -919,7 +943,11 @@ __device__ __forceinline__ bool process_logical_batch_gaussians(
           normal_out,
           cur_idx,
           n_accumulated,
-          done_mask);
+          done_mask,
+          depth_first_moment,
+          depth_second_moment,
+          log_depth_first_moment,
+          log_depth_second_moment);
 
         // CTA-wide early stop: if every pixel in the CTA has crossed
         // the transmittance threshold (`done_mask == ALL_DONE` on every
@@ -983,6 +1011,37 @@ __device__ __forceinline__ void persist_batch_state(
             fwd_batch_state[slot_base + (FWD_BATCH_STATE_PIX_OFFSET + CDIM + 1) * ppt64 + pix64] = normal_out[p].y;
             fwd_batch_state[slot_base + (FWD_BATCH_STATE_PIX_OFFSET + CDIM + 2) * ppt64 + pix64] = normal_out[p].z;
         }
+    }
+}
+
+// Persist the cumulative linear depth moments for one logical forward-batch
+// boundary. A separate tensor keeps ordinary render-call state unchanged.
+template<uint32_t PIXELS_PER_THREAD_T, uint32_t CTA_SIZE_T>
+__device__ __forceinline__ void persist_depth_moment_state(
+    uint32_t c,
+    int64_t batch_base_slot,
+    uint32_t pixels_per_tile,
+    uint32_t tid,
+    const float (&depth_first_moment)[PIXELS_PER_THREAD_T],
+    const float (&depth_second_moment)[PIXELS_PER_THREAD_T],
+    const float (&log_depth_first_moment)[PIXELS_PER_THREAD_T],
+    const float (&log_depth_second_moment)[PIXELS_PER_THREAD_T],
+    float *__restrict__ fwd_depth_moment_state
+)
+{
+    const int64_t ppt64 = static_cast<int64_t>(pixels_per_tile);
+#pragma unroll
+    for(uint32_t p = 0; p < PIXELS_PER_THREAD_T; ++p)
+    {
+        const int64_t slot = batch_base_slot + static_cast<int64_t>(c);
+        const int64_t slot_base = slot * static_cast<int64_t>(DEPTH_MOMENT_COUNT) * ppt64;
+        const int64_t pix64 = static_cast<int64_t>(tid + p * CTA_SIZE_T);
+        fwd_depth_moment_state[slot_base + DEPTH_FIRST_MOMENT * ppt64 + pix64] = depth_first_moment[p];
+        fwd_depth_moment_state[slot_base + DEPTH_SECOND_MOMENT * ppt64 + pix64] = depth_second_moment[p];
+        fwd_depth_moment_state[slot_base + LOG_DEPTH_FIRST_MOMENT * ppt64 + pix64]
+            = log_depth_first_moment[p];
+        fwd_depth_moment_state[slot_base + LOG_DEPTH_SECOND_MOMENT * ppt64 + pix64]
+            = log_depth_second_moment[p];
     }
 }
 } // namespace gsplat

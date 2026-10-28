@@ -101,6 +101,7 @@ __global__ void
         float *__restrict__ render_normals,        // [B, C, image_height, image_width, 3] optional
         int32_t *__restrict__ last_ids,            // [B, C, image_height, image_width] optional
         int32_t *__restrict__ sample_counts,       // [B, C, image_height, image_width] optional
+        float *__restrict__ depth_moments,     // [B, C, image_height, image_width, 4] optional
         // Optional CSR batch-state persistence (for MixedBatch bwd reuse). See
         // RasterizeCSR.cuh.
         // Storage layout: [total_batches][state_dim][pixels_per_tile] fp32.
@@ -115,7 +116,8 @@ __global__ void
         // lockstep by the launcher (gated on `total_batches > 0`); both null ⇔
         // persistence disabled (e.g. `n_isects == 0`).
         const int32_t *__restrict__ batch_offsets_csr, // [num_tiles + 1]
-        float *__restrict__ fwd_batch_state            // [total_batches, state_dim, pixels_per_tile]
+        float *__restrict__ fwd_batch_state,           // [total_batches, state_dim, pixels_per_tile]
+        float *__restrict__ fwd_depth_moment_state     // [total_batches, 4, pixels_per_tile]
     )
 {
     // FETCH_SIZE = gaussians fetched per cooperative-fetch round (one per
@@ -180,6 +182,10 @@ __global__ void
     if(sample_counts != nullptr)
     {
         sample_counts += iid * image_height * image_width;
+    }
+    if(depth_moments != nullptr)
+    {
+        depth_moments += static_cast<uint64_t>(iid) * image_height * image_width * DEPTH_MOMENT_COUNT;
     }
     if(backgrounds != nullptr)
     {
@@ -248,6 +254,14 @@ __global__ void
                     if(sample_counts != nullptr)
                     {
                         sample_counts[pc[p].pix_id] = 0;
+                    }
+                    if(depth_moments != nullptr)
+                    {
+#    pragma unroll
+                        for(uint32_t k = 0; k < DEPTH_MOMENT_COUNT; ++k)
+                        {
+                            depth_moments[pc[p].pix_id * DEPTH_MOMENT_COUNT + k] = 0.0f;
+                        }
                     }
                 }
             }
@@ -385,6 +399,10 @@ __global__ void
     int32_t n_accumulated[PIXELS_PER_THREAD] = {0};
     float pix_out[PIXELS_PER_THREAD][CDIM]   = {0.f};
     vec3 normal_out[PIXELS_PER_THREAD]       = {};
+    float depth_first_moment[PIXELS_PER_THREAD]      = {};
+    float depth_second_moment[PIXELS_PER_THREAD]     = {};
+    float log_depth_first_moment[PIXELS_PER_THREAD]  = {};
+    float log_depth_second_moment[PIXELS_PER_THREAD] = {};
 
     // Per-batch persist of the CURRENT per-pixel cumulative state to CSR
     // slot c is delegated to `persist_batch_state` in
@@ -453,7 +471,11 @@ __global__ void
             normal_out,
             cur_idx,
             n_accumulated,
-            done_mask
+            done_mask,
+            depth_moments != nullptr ? depth_first_moment : nullptr,
+            depth_moments != nullptr ? depth_second_moment : nullptr,
+            depth_moments != nullptr ? log_depth_first_moment : nullptr,
+            depth_moments != nullptr ? log_depth_second_moment : nullptr
         );
 
         // --- Batch-boundary persist ---------------------------------------
@@ -471,6 +493,20 @@ __global__ void
             persist_batch_state<CDIM, PIXELS_PER_THREAD, CTA_SIZE, ReturnNormals>(
                 lb, batch_base_slot, pixels_per_tile, tid, T, pix_out, normal_out, fwd_batch_state
             );
+            if(fwd_depth_moment_state != nullptr)
+            {
+                persist_depth_moment_state<PIXELS_PER_THREAD, CTA_SIZE>(
+                    lb,
+                    batch_base_slot,
+                    pixels_per_tile,
+                    tid,
+                    depth_first_moment,
+                    depth_second_moment,
+                    log_depth_first_moment,
+                    log_depth_second_moment,
+                    fwd_depth_moment_state
+                );
+            }
         }
 
         // Block-level early exit (the all-done vote was already done
@@ -492,6 +528,20 @@ __global__ void
                     persist_batch_state<CDIM, PIXELS_PER_THREAD, CTA_SIZE, ReturnNormals>(
                         lbb, batch_base_slot, pixels_per_tile, tid, T, pix_out, normal_out, fwd_batch_state
                     );
+                    if(fwd_depth_moment_state != nullptr)
+                    {
+                        persist_depth_moment_state<PIXELS_PER_THREAD, CTA_SIZE>(
+                            lbb,
+                            batch_base_slot,
+                            pixels_per_tile,
+                            tid,
+                            depth_first_moment,
+                            depth_second_moment,
+                            log_depth_first_moment,
+                            log_depth_second_moment,
+                            fwd_depth_moment_state
+                        );
+                    }
                 }
             }
             break;
@@ -526,6 +576,14 @@ __global__ void
             if(sample_counts != nullptr)
             {
                 sample_counts[pc[p].pix_id] = n_accumulated[p];
+            }
+            if(depth_moments != nullptr)
+            {
+                const uint32_t offset = pc[p].pix_id * DEPTH_MOMENT_COUNT;
+                depth_moments[offset + DEPTH_FIRST_MOMENT] = depth_first_moment[p];
+                depth_moments[offset + DEPTH_SECOND_MOMENT] = depth_second_moment[p];
+                depth_moments[offset + LOG_DEPTH_FIRST_MOMENT] = log_depth_first_moment[p];
+                depth_moments[offset + LOG_DEPTH_SECOND_MOMENT] = log_depth_second_moment[p];
             }
         }
     }
@@ -575,7 +633,9 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_impl(
     at::Tensor last_ids,                    // [..., C, image_height, image_width]
     at::optional<at::Tensor> sample_counts, // [..., C, image_height, image_width]
     at::optional<at::Tensor> normals,       // [..., C, image_height, image_width, 3]
-    at::Tensor fwd_batch_state              // [total_batches, state_dim, pixels_per_tile] fp32
+    at::Tensor fwd_batch_state,             // [total_batches, state_dim, pixels_per_tile] fp32
+    at::Tensor fwd_depth_moment_state,      // [total_batches, 4, pixels_per_tile] fp32
+    at::optional<at::Tensor> depth_moments
 )
 {
     // Note: quats need to be normalized before passing in.
@@ -731,9 +791,11 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_impl(
             data_ptr_or_null<float>(normals),
             data_ptr_or_null<int32_t>(last_ids.defined(), last_ids),
             data_ptr_or_null<int32_t>(sample_counts),
+            data_ptr_or_null<float>(depth_moments),
             // CSR batch state persistence.
             data_ptr_or_null<const int32_t>(total_batches > 0, batch_offsets),
-            data_ptr_or_null<float>(total_batches > 0, fwd_batch_state)
+            data_ptr_or_null<float>(total_batches > 0, fwd_batch_state),
+            data_ptr_or_null<float>(total_batches > 0 && fwd_depth_moment_state.defined(), fwd_depth_moment_state)
         );
     };
     const bool dispatched = dispatch::dispatch(
@@ -791,7 +853,9 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel(
     at::Tensor last_ids,                    // [..., C, image_height, image_width]
     at::optional<at::Tensor> sample_counts, // [..., C, image_height, image_width]
     at::optional<at::Tensor> normals,       // [..., C, image_height, image_width, 3]
-    at::Tensor fwd_batch_state              // [total_batches, state_dim, pixels_per_tile] fp32
+    at::Tensor fwd_batch_state,             // [total_batches, state_dim, pixels_per_tile] fp32
+    at::Tensor fwd_depth_moment_state,      // [total_batches, 4, pixels_per_tile] fp32
+    at::optional<at::Tensor> depth_moments
 )
 {
     launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_impl(
@@ -830,7 +894,9 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel(
         last_ids,
         sample_counts,
         normals,
-        fwd_batch_state
+        fwd_batch_state,
+        fwd_depth_moment_state,
+        depth_moments
     );
 }
 } // namespace gsplat

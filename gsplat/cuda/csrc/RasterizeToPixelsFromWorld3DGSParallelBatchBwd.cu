@@ -267,7 +267,7 @@ at::Tensor compute_bid_to_slot(
 //
 // Grid: 1D {total_batches, 1, 1}; each CTA's (tile_linear, batch_id) is decoded
 // via a binary search on batch_offsets in the preamble.
-template<uint32_t CDIM, bool ReturnNormals, bool UseHitDistance, typename scalar_t>
+template<uint32_t CDIM, bool ReturnNormals, bool UseHitDistance, bool ReturnDepthMoments, typename scalar_t>
 __global__ void rasterize_gradient_bwd_kernel(
     const uint32_t B,
     const uint32_t C,
@@ -305,11 +305,13 @@ __global__ void rasterize_gradient_bwd_kernel(
     // fwd outputs
     const scalar_t *__restrict__ render_alphas, // [B, C, image_height, image_width, 1]
     const int32_t *__restrict__ last_ids,       // [B, C, image_height, image_width]
+    const scalar_t *__restrict__ depth_moments, // [B, C, image_height, image_width, 4] optional
     // grad outputs
     const scalar_t *__restrict__ v_render_colors,  // [B, C, image_height,
                                                    // image_width, CDIM]
     const scalar_t *__restrict__ v_render_alphas,  // [B, C, image_height, image_width, 1]
     const scalar_t *__restrict__ v_render_normals, // [B, C, image_height, image_width, 3] optional
+    const scalar_t *__restrict__ v_depth_moments,  // [B, C, image_height, image_width, 4] optional
     // grad inputs
     vec3 *__restrict__ v_means,         // [B, N, 3]
     vec4 *__restrict__ v_quats,         // [B, N, 4]
@@ -326,6 +328,7 @@ __global__ void rasterize_gradient_bwd_kernel(
     // it with post-saturation state; batch CTAs with batch_id > c_stop skip
     // the pixel because it never reached those gaussians.
     const scalar_t *__restrict__ fwd_batch_state, // [total_batches, state_dim, pixels_per_tile]
+    const scalar_t *__restrict__ fwd_depth_moment_state, // [total_batches, 4, pixels_per_tile] optional
     const int32_t *__restrict__ batch_offsets,    // [num_tiles + 1]
     const uint16_t *__restrict__ compose_c_stop   // [num_tiles, pixels_per_tile] or null
 )
@@ -364,6 +367,11 @@ __global__ void rasterize_gradient_bwd_kernel(
     if constexpr(ReturnNormals)
     {
         v_render_normals += image_index * image_area * 3;
+    }
+    if constexpr(ReturnDepthMoments)
+    {
+        depth_moments += image_index * image_area * DEPTH_MOMENT_COUNT;
+        v_depth_moments += image_index * image_area * DEPTH_MOMENT_COUNT;
     }
     if(backgrounds != nullptr)
     {
@@ -490,6 +498,16 @@ __global__ void rasterize_gradient_bwd_kernel(
         }
     }
 
+    float v_depth_m[DEPTH_MOMENT_COUNT] = {};
+    if constexpr(ReturnDepthMoments)
+    {
+#    pragma unroll
+        for(uint32_t k = 0; k < DEPTH_MOMENT_COUNT; ++k)
+        {
+            v_depth_m[k] = pixel_valid ? v_depth_moments[pix_id * DEPTH_MOMENT_COUNT + k] : 0.f;
+        }
+    }
+
     // ---- Materialise batch-start state from `fwd_batch_state` ----------------
     // The monolithic bwd recurrence satisfies, at the start of bwd batch c:
     //   T_start_c          = T_fwd at fwd-batch c (depth-walk index from front)
@@ -556,6 +574,27 @@ __global__ void rasterize_gradient_bwd_kernel(
             const vec3 normal_delta    = normal_final - normal_boundary;
             normal_accum_dot
                 = normal_delta.x * v_render_n.x + normal_delta.y * v_render_n.y + normal_delta.z * v_render_n.z;
+        }
+    }
+
+    // Linear moment outputs use exactly the same reverse-compositing
+    // recurrence as rendered feature channels. The dedicated forward state
+    // supplies the moment prefix at this batch boundary.
+    float depth_moment_accum_dot = 0.f;
+    if constexpr(ReturnDepthMoments)
+    {
+        if(pixel_valid)
+        {
+            const int64_t ppt64 = static_cast<int64_t>(pixels_per_tile);
+            const int64_t state_base
+                = static_cast<int64_t>(bid) * DEPTH_MOMENT_COUNT * ppt64 + thread_rank;
+#    pragma unroll
+            for(uint32_t k = 0; k < DEPTH_MOMENT_COUNT; ++k)
+            {
+                const float final_value = depth_moments[pix_id * DEPTH_MOMENT_COUNT + k];
+                const float boundary_value = fwd_depth_moment_state[state_base + k * ppt64];
+                depth_moment_accum_dot += (final_value - boundary_value) * v_depth_m[k];
+            }
         }
     }
     float background_render_dot = 0.f;
@@ -708,6 +747,11 @@ __global__ void rasterize_gradient_bwd_kernel(
                         grds         = scale * (grd_n * hit_t);
                         hit_distance = glm::length(grds);
                     }
+                    else if constexpr(ReturnDepthMoments)
+                    {
+                        grds         = scale * (grd_n * hit_t);
+                        hit_distance = glm::length(grds);
+                    }
                 }
             }
 
@@ -795,6 +839,24 @@ __global__ void rasterize_gradient_bwd_kernel(
                     normal_render_dot = glm::dot(normal, v_render_n);
                 }
 
+                float depth_moment_sample_dot = 0.f;
+                float log_hit_distance = 0.f;
+                if constexpr(ReturnDepthMoments)
+                {
+                    log_hit_distance = __logf(fmaxf(hit_distance, FLT_MIN));
+                    const float moment_values[DEPTH_MOMENT_COUNT] = {
+                        hit_distance,
+                        hit_distance * hit_distance,
+                        log_hit_distance,
+                        log_hit_distance * log_hit_distance,
+                    };
+#    pragma unroll
+                    for(uint32_t k = 0; k < DEPTH_MOMENT_COUNT; ++k)
+                    {
+                        depth_moment_sample_dot += moment_values[k] * v_depth_m[k];
+                    }
+                }
+
                 // Add contribution from normals to v_alpha (product rule term)
                 float v_alpha = rgb_render_dot * T - render_accum_dot * ra + T_final * ra * v_alpha_ind_coeff;
                 // Forward: render_normals += normal * vis (where vis = alpha * T)
@@ -803,18 +865,40 @@ __global__ void rasterize_gradient_bwd_kernel(
                 {
                     v_alpha += normal_render_dot * T - normal_accum_dot * ra;
                 }
+                if constexpr(ReturnDepthMoments)
+                {
+                    v_alpha += depth_moment_sample_dot * T - depth_moment_accum_dot * ra;
+                }
 
                 // Add contribution from hit distance (if enabled)
                 vec3 v_grd_n_hit = vec3(0.f);
                 vec3 v_gro_hit   = vec3(0.f);
-                if constexpr(UseHitDistance)
+                if constexpr(UseHitDistance || ReturnDepthMoments)
                 {
                     // Depth-channel gradient for the hit_distance VJP.
                     // v_rgb_local[CDIM-1] was left at 0 above (fwd replaces
                     // that color channel with hit_distance, so the color
                     // VJP must be 0). Compute v_depth directly from
                     // v_render_c instead of reading the zeroed slot.
-                    const float v_depth = fac * v_render_c[CDIM - 1];
+                    float v_depth = 0.f;
+                    if constexpr(UseHitDistance)
+                    {
+                        v_depth += fac * v_render_c[CDIM - 1];
+                    }
+                    if constexpr(ReturnDepthMoments)
+                    {
+                        float moment_depth_derivative
+                            = v_depth_m[DEPTH_FIRST_MOMENT]
+                              + 2.0f * hit_distance * v_depth_m[DEPTH_SECOND_MOMENT];
+                        if(hit_distance > FLT_MIN)
+                        {
+                            moment_depth_derivative
+                                += (v_depth_m[LOG_DEPTH_FIRST_MOMENT]
+                                    + 2.0f * log_hit_distance * v_depth_m[LOG_DEPTH_SECOND_MOMENT])
+                                   / hit_distance;
+                        }
+                        v_depth += fac * moment_depth_derivative;
+                    }
 
                     // hit_t / grds / hit_distance were computed in the
                     // alpha-recompute block above and hoisted to outer scope;
@@ -887,6 +971,10 @@ __global__ void rasterize_gradient_bwd_kernel(
                 }
 
                 render_accum_dot += rgb_render_dot * fac;
+                if constexpr(ReturnDepthMoments)
+                {
+                    depth_moment_accum_dot += depth_moment_sample_dot * fac;
+                }
 
                 // Accumulate normal contribution (for product rule in next iterations).
                 if constexpr(ReturnNormals)
@@ -981,10 +1069,12 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
     // forward outputs
     const at::Tensor render_alphas, // [..., C, image_height, image_width, 1]
     const at::Tensor last_ids,      // [..., C, image_height, image_width]
+    const at::optional<at::Tensor> depth_moments,
     // gradients of outputs
     const at::Tensor v_render_colors,                // [..., C, image_height, image_width, 3]
     const at::Tensor v_render_alphas,                // [..., C, image_height, image_width, 1]
     const at::optional<at::Tensor> v_render_normals, // [..., C, image_height, image_width, 3]
+    const at::optional<at::Tensor> v_depth_moments,
     // CSR batch structure precomputed by the forward pass
     const at::Tensor batches_per_tile, // [num_tiles] int32
     const at::Tensor batch_offsets,    // [num_tiles + 1] int32
@@ -994,6 +1084,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
     // derives the per-batch starting accumulators in its preamble — no
     // separate state-scan or prefix-scan pass needed.
     const at::Tensor fwd_batch_state, // [total_batches, state_dim, pixels_per_tile] fp32
+    const at::Tensor fwd_depth_moment_state, // [total_batches, 4, pixels_per_tile] fp32
     // ParallelBatch-only saturation handoff. MixedBatch passes an undefined
     // tensor and uses the terminal fwd_batch_state slot as before.
     const at::Tensor compose_c_stop, // [num_tiles, pixels_per_tile] uint16
@@ -1086,11 +1177,16 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
     TORCH_CHECK(batch_offsets.numel() == static_cast<int64_t>(num_tiles) + 1, "batch_offsets has wrong size");
 
     const bool return_normals = v_render_normals.has_value();
-    auto launch_kernel        = [&]<typename ChannelsT, typename ReturnNormalsT, typename UseHitDistanceT>()
+    const bool return_depth_moments = v_depth_moments.has_value();
+    auto launch_kernel        = [&]<typename ChannelsT,
+                                    typename ReturnNormalsT,
+                                    typename UseHitDistanceT,
+                                    typename ReturnDepthMomentsT>()
     {
         constexpr uint32_t CDIM       = ChannelsT::value;
         constexpr bool ReturnNormals  = static_cast<bool>(ReturnNormalsT::value);
         constexpr bool UseHitDistance = static_cast<bool>(UseHitDistanceT::value);
+        constexpr bool ReturnDepthMoments = static_cast<bool>(ReturnDepthMomentsT::value);
         int64_t shmem_size
             = tile_size
             * tile_size
@@ -1123,6 +1219,17 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
             pixels_per_tile,
             "])"
         );
+        if constexpr(ReturnDepthMoments)
+        {
+            TORCH_CHECK(depth_moments.has_value(), "depth_moments must be defined when its gradient is defined");
+            TORCH_CHECK(fwd_depth_moment_state.dim() == 3, "fwd_depth_moment_state must be 3-D");
+            TORCH_CHECK(
+                fwd_depth_moment_state.size(0) == total_batches
+                    && fwd_depth_moment_state.size(1) == DEPTH_MOMENT_COUNT
+                    && fwd_depth_moment_state.size(2) == pixels_per_tile,
+                "fwd_depth_moment_state has wrong shape"
+            );
+        }
         TORCH_CHECK(
             fwd_batch_state.numel() <= INT32_MAX,
             "ParallelBatch fwd_batch_state exceeds signed 32-bit device "
@@ -1153,7 +1260,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
         // CSR slot read per batch (the terminal slot).
         dim3 grad_grid = {static_cast<uint32_t>(total_batches), 1, 1};
         if(cudaFuncSetAttribute(
-               rasterize_gradient_bwd_kernel<CDIM, ReturnNormals, UseHitDistance, float>,
+               rasterize_gradient_bwd_kernel<CDIM, ReturnNormals, UseHitDistance, ReturnDepthMoments, float>,
                cudaFuncAttributeMaxDynamicSharedMemorySize,
                shmem_size
            )
@@ -1161,7 +1268,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
         {
             AT_ERROR("Failed to set shmem for gradient kernel (", shmem_size, " bytes).");
         }
-        rasterize_gradient_bwd_kernel<CDIM, ReturnNormals, UseHitDistance, float>
+        rasterize_gradient_bwd_kernel<CDIM, ReturnNormals, UseHitDistance, ReturnDepthMoments, float>
             <<<grad_grid, threads, shmem_size, at::cuda::getCurrentCUDAStream()>>>(
                 B,
                 C,
@@ -1195,9 +1302,11 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
                 flatten_ids.const_data_ptr<int32_t>(),
                 render_alphas.const_data_ptr<float>(),
                 last_ids.const_data_ptr<int32_t>(),
+                data_ptr_or_null<const float>(depth_moments),
                 v_render_colors.const_data_ptr<float>(),
                 v_render_alphas.const_data_ptr<float>(),
                 data_ptr_or_null<const float>(v_render_normals),
+                data_ptr_or_null<const float>(v_depth_moments),
                 data_ptr_as<vec3, float>(v_means),
                 data_ptr_as<vec4, float>(v_quats),
                 data_ptr_as<vec3, float>(v_scales),
@@ -1205,6 +1314,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
                 v_opacities.data_ptr<float>(),
                 data_ptr_or_null<float>(v_rays),
                 fwd_batch_state.const_data_ptr<float>(),
+                data_ptr_or_null<const float>(ReturnDepthMoments, fwd_depth_moment_state),
                 batch_offsets.const_data_ptr<int32_t>(),
                 data_ptr_or_null<const uint16_t>(use_compose_stop, compose_c_stop)
             );
@@ -1213,6 +1323,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
         SupportedChannels{channels},
         dispatch::IntParam<0, 1>{return_normals ? 1 : 0},
         dispatch::IntParam<0, 1>{use_hit_distance ? 1 : 0},
+        dispatch::IntParam<0, 1>{return_depth_moments ? 1 : 0},
         std::move(launch_kernel)
     );
     TORCH_CHECK(dispatched, "dispatch failed: no matching compile-time instantiation for runtime parameters");

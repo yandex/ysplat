@@ -265,7 +265,11 @@ __device__ __forceinline__ void process_batch_gaussians_fwd(
         normal_out,
         cur_idx,
         n_accumulated,
-        done_mask
+        done_mask,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr
     );
 }
 

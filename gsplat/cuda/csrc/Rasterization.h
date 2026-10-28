@@ -511,10 +511,12 @@ struct RasterizeToPixelsFromWorld3DGSFwdResult
     at::Tensor batches_per_tile;
     at::Tensor batch_offsets;
     at::Tensor fwd_batch_state;
+    at::Tensor fwd_depth_moment_state;
     // Defined only for ParallelBatch. MixedBatch uses the serial forward path,
     // while ParallelBatch stores the per-pixel saturation handoff batch here.
     at::Tensor compose_c_stop;
     at::Tensor priming_state;
+    at::Tensor depth_moments;
 };
 
 // Internal C++ forward entry point. When `fwd_only` is false, the caller is
@@ -553,7 +555,8 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
     bool return_last_ids,
     const at::optional<at::Tensor> sample_counts, // [..., C, image_height, image_width] optional
     const at::optional<at::Tensor> normals,       // [..., C, image_height, image_width, 3] optional output tensor
-    bool unsafe_masked_tile_outputs
+    bool unsafe_masked_tile_outputs,
+    bool return_depth_dispersion = false
 );
 
 // Public op result type. The single dispatcher entry below returns this and the
@@ -566,6 +569,7 @@ struct RasterizeToPixelsFromWorld3DGSResult
     at::optional<at::Tensor> last_ids;
     at::optional<at::Tensor> sample_counts;
     at::optional<at::Tensor> normals;
+    at::optional<at::Tensor> depth_moments;
 };
 
 template<>
@@ -573,7 +577,9 @@ struct TorchArgDef<RasterizeToPixelsFromWorld3DGSResult>
 {
     static auto to(const RasterizeToPixelsFromWorld3DGSResult &r)
     {
-        return to_torch_args(r.renders, r.alphas, r.last_ids, r.sample_counts, r.normals);
+        return to_torch_args(
+            r.renders, r.alphas, r.last_ids, r.sample_counts, r.normals, r.depth_moments
+        );
     }
 
     template<class TT>
@@ -585,6 +591,7 @@ struct TorchArgDef<RasterizeToPixelsFromWorld3DGSResult>
             .last_ids      = std::get<2>(std::forward<TT>(t)),
             .sample_counts = std::get<3>(std::forward<TT>(t)),
             .normals       = std::get<4>(std::forward<TT>(t)),
+            .depth_moments = std::get<5>(std::forward<TT>(t)),
         };
     }
 };
@@ -625,6 +632,7 @@ RasterizeToPixelsFromWorld3DGSResult rasterize_to_pixels_from_world_3dgs(
     bool return_normals,
     int64_t renderer_config,
     bool return_last_ids,
-    bool unsafe_masked_tile_outputs
+    bool unsafe_masked_tile_outputs,
+    bool return_depth_dispersion
 );
 } // namespace gsplat
