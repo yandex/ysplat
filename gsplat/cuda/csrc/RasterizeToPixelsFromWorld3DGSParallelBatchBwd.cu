@@ -277,6 +277,7 @@ __global__ void rasterize_gradient_bwd_kernel(
     const vec3 *__restrict__ means,           // [B, N, 3]
     const vec4 *__restrict__ quats,           // [B, N, 4]
     const vec3 *__restrict__ scales,          // [B, N, 3]
+    const vec3 *__restrict__ velocities,      // [B, N, 3] optional
     const scalar_t *__restrict__ colors,      // [B, C, N, CDIM] or [nnz, CDIM]
     const scalar_t *__restrict__ opacities,   // [B, C, N] or [nnz]
     const scalar_t *__restrict__ backgrounds, // [B, C, CDIM]
@@ -293,6 +294,7 @@ __global__ void rasterize_gradient_bwd_kernel(
     const CameraModelType camera_model_type,
     const ShutterType rs_type,
     const scalar_t *__restrict__ rays,                             // [B, C, H, W, 6]
+    const scalar_t *__restrict__ rays_time,                        // [B, C, H, W] optional
     const scalar_t *__restrict__ radial_coeffs,                    // [B, C, 6] or [B, C, 4] optional
     const scalar_t *__restrict__ tangential_coeffs,                // [B, C, 2] optional
     const scalar_t *__restrict__ thin_prism_coeffs,                // [B, C, 4] optional
@@ -319,6 +321,7 @@ __global__ void rasterize_gradient_bwd_kernel(
     scalar_t *__restrict__ v_colors,    // [B, C, N, CDIM] or [nnz, CDIM]
     scalar_t *__restrict__ v_opacities, // [B, C, N] or [nnz]
     scalar_t *__restrict__ v_rays,      // [B, C, image_height, image_width, 6]
+    vec3 *__restrict__ v_velocities,    // [B, N, 3] optional
     // Fwd-persisted per-batch cumulative state (CSR-packed; see
     // `RasterizeCSR.cuh`). Within a slot, state elements are ordered as
     // [T, pix_out[CDIM], optional normal_out[3]] and pixels are fastest-varying. Slot
@@ -385,6 +388,10 @@ __global__ void rasterize_gradient_bwd_kernel(
     {
         rays += image_index * image_area * 6;
     }
+    if(rays_time != nullptr)
+    {
+        rays_time += image_index * image_area;
+    }
     if(v_rays != nullptr)
     {
         v_rays += image_index * image_area * 6;
@@ -450,6 +457,7 @@ __global__ void rasterize_gradient_bwd_kernel(
     );
     const vec3 ray_d            = ray.ray_dir;
     const vec3 ray_o            = ray.ray_org;
+    const float ray_t           = (inside && rays_time != nullptr) ? rays_time[pix_id] : 0.f;
     const bool pix_valid_raw    = inside && ray.valid_flag;
     const bool has_compose_stop = compose_c_stop != nullptr;
     const int32_t thread_rank   = static_cast<int32_t>(tr);
@@ -617,6 +625,9 @@ __global__ void rasterize_gradient_bwd_kernel(
     vec3 *scale_batch       = reinterpret_cast<vec3 *>(&xyz_opacity_batch[block_size]);
     vec4 *quat_batch        = reinterpret_cast<vec4 *>(&scale_batch[block_size]);
     float *rgbs_batch       = (float *)&quat_batch[block_size];
+    vec3 *velocity_batch    = velocities != nullptr
+                                ? reinterpret_cast<vec3 *>(&rgbs_batch[block_size * cdim_smem_stride<CDIM>()])
+                                : nullptr;
 
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     const int32_t warp_bin_final   = cg::reduce(warp, bin_final, cg::greater<int>());
@@ -643,6 +654,10 @@ __global__ void rasterize_gradient_bwd_kernel(
             xyz_opacity_batch[tr] = {xyz.x, xyz.y, xyz.z, opac};
             scale_batch[tr]       = scales[isect_bid * N + isect_gid];
             quat_batch[tr]        = quats[isect_bid * N + isect_gid];
+            if(velocity_batch != nullptr)
+            {
+                velocity_batch[tr] = velocities[isect_bid * N + isect_gid];
+            }
             assert(glm::dot(quat_batch[tr], quat_batch[tr]) > 0.f);
             assert(scale_batch[tr][0] > 0.f && scale_batch[tr][1] > 0.f && scale_batch[tr][2] > 0.f);
 #    pragma unroll
@@ -696,6 +711,10 @@ __global__ void rasterize_gradient_bwd_kernel(
                 xyz                 = {xyz_opac[0], xyz_opac[1], xyz_opac[2]};
                 scale               = scale_batch[t];
                 quat                = quat_batch[t];
+                if(velocity_batch != nullptr)
+                {
+                    xyz += velocity_batch[t] * ray_t;
+                }
 
                 R          = quat_to_rotmat(quat);
                 S          = mat3(1.0f / scale[0], 0.f, 0.f, 0.f, 1.0f / scale[1], 0.f, 0.f, 0.f, 1.0f / scale[2]);
@@ -762,6 +781,7 @@ __global__ void rasterize_gradient_bwd_kernel(
             }
             float v_rgb_local[CDIM] = {0.f};
             vec3 v_mean_local       = {0.f, 0.f, 0.f};
+            vec3 v_velocity_local   = {0.f, 0.f, 0.f};
             vec3 v_scale_local      = {0.f, 0.f, 0.f};
             vec4 v_quat_local       = {0.f, 0.f, 0.f, 0.f};
             float v_opacity_local   = 0.f;
@@ -935,7 +955,8 @@ __global__ void rasterize_gradient_bwd_kernel(
                     mat3 v_Mt         = glm::outerProduct(v_grd, ray_d) + glm::outerProduct(v_gro, o_minus_mu);
                     vec3 v_o_minus_mu = glm::transpose(Mt) * v_gro;
 
-                    v_mean_local += -v_o_minus_mu;
+                    v_mean_local     += -v_o_minus_mu;
+                    v_velocity_local += -v_o_minus_mu * ray_t;
 
                     // Compute ray gradients
                     // From o_minus_mu = ray_o - xyz, we get:
@@ -984,6 +1005,10 @@ __global__ void rasterize_gradient_bwd_kernel(
             }
             warpSum<CDIM>(v_rgb_local, warp);
             warpSum(v_mean_local, warp);
+            if(v_velocities != nullptr)
+            {
+                warpSum(v_velocity_local, warp);
+            }
             warpSum(v_scale_local, warp);
             warpSum(v_quat_local, warp);
             warpSum(v_opacity_local, warp);
@@ -1004,6 +1029,14 @@ __global__ void rasterize_gradient_bwd_kernel(
                 gpuAtomicAdd(v_mean_ptr, v_mean_local.x);
                 gpuAtomicAdd(v_mean_ptr + 1, v_mean_local.y);
                 gpuAtomicAdd(v_mean_ptr + 2, v_mean_local.z);
+
+                if(v_velocities != nullptr)
+                {
+                    float *v_velocity_ptr = (float *)(v_velocities) + 3 * (isect_bid * N + isect_gid);
+                    gpuAtomicAdd(v_velocity_ptr, v_velocity_local.x);
+                    gpuAtomicAdd(v_velocity_ptr + 1, v_velocity_local.y);
+                    gpuAtomicAdd(v_velocity_ptr + 2, v_velocity_local.z);
+                }
 
                 float *v_scale_ptr = (float *)(v_scales) + 3 * (isect_bid * N + isect_gid);
                 gpuAtomicAdd(v_scale_ptr, v_scale_local.x);
@@ -1039,6 +1072,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
     const at::Tensor means,                     // [..., N, 3]
     const at::Tensor quats,                     // [..., N, 4]
     const at::Tensor scales,                    // [..., N, 3]
+    const at::optional<at::Tensor> velocities,  // [..., N, 3]
     const at::Tensor colors,                    // [..., C, N, channels] or [nnz, channels]
     const at::Tensor opacities,                 // [..., C, N] or [nnz]
     const at::optional<at::Tensor> backgrounds, // [..., C, channels]
@@ -1056,6 +1090,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
     const c10::intrusive_ptr<UnscentedTransformParameters> &ut_params,
     ShutterType rs_type,
     const at::optional<at::Tensor> rays,                                       // [..., C, H, W, 6]
+    const at::optional<at::Tensor> rays_time,                                  // [..., C, H, W]
     const at::optional<at::Tensor> radial_coeffs,                              // [..., C, 6] or [..., C, 4] optional
     const at::optional<at::Tensor> tangential_coeffs,                          // [..., C, 2] optional
     const at::optional<at::Tensor> thin_prism_coeffs,                          // [..., C, 4] optional
@@ -1094,7 +1129,8 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
     at::Tensor v_scales,            // [..., N, 3]
     at::Tensor v_colors,            // [..., C, N, channels] or [nnz, channels]
     at::Tensor v_opacities,         // [..., C, N] or [nnz]
-    at::optional<at::Tensor> v_rays // [..., C, image_height, image_width, 6]
+    at::optional<at::Tensor> v_rays, // [..., C, image_height, image_width, 6]
+    at::optional<at::Tensor> v_velocities // [..., N, 3]
 )
 {
     bool packed = opacities.dim() == 1;
@@ -1190,7 +1226,12 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
         int64_t shmem_size
             = tile_size
             * tile_size
-            * (sizeof(int32_t) + sizeof(vec4) + sizeof(vec3) + sizeof(vec4) + sizeof(float) * cdim_smem_stride<CDIM>());
+            * (sizeof(int32_t)
+               + sizeof(vec4)
+               + sizeof(vec3)
+               + sizeof(vec4)
+               + sizeof(float) * cdim_smem_stride<CDIM>()
+               + (velocities.has_value() ? sizeof(vec3) : 0));
 
         // Shape parity check for the fwd-persisted state. fwd allocates with
         // shape `[total_batches, state_dim, pixels_per_tile]` and fills every
@@ -1277,6 +1318,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
                 data_ptr_as<const vec3, float>(means),
                 data_ptr_as<const vec4, float>(quats),
                 data_ptr_as<const vec3, float>(scales),
+                velocities.has_value() ? data_ptr_as<const vec3, float>(velocities.value()) : nullptr,
                 colors.const_data_ptr<float>(),
                 opacities.const_data_ptr<float>(),
                 data_ptr_or_null<const float>(backgrounds),
@@ -1292,6 +1334,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
                 camera_model,
                 rs_type,
                 data_ptr_or_null<const float>(rays),
+                data_ptr_or_null<const float>(rays_time),
                 data_ptr_or_null<const float>(radial_coeffs),
                 data_ptr_or_null<const float>(tangential_coeffs),
                 data_ptr_or_null<const float>(thin_prism_coeffs),
@@ -1313,6 +1356,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
                 v_colors.data_ptr<float>(),
                 v_opacities.data_ptr<float>(),
                 data_ptr_or_null<float>(v_rays),
+                v_velocities.has_value() ? data_ptr_as<vec3, float>(v_velocities.value()) : nullptr,
                 fwd_batch_state.const_data_ptr<float>(),
                 data_ptr_or_null<const float>(ReturnDepthMoments, fwd_depth_moment_state),
                 batch_offsets.const_data_ptr<int32_t>(),

@@ -1932,7 +1932,9 @@ ProjectionUT3DGSFusedResult projection_ut_3dgs_fused_impl(
     const at::optional<c10::intrusive_ptr<FThetaCameraDistortionParameters>>
         &ftheta_coeffs, // shared parameters for all cameras
     const at::optional<c10::intrusive_ptr<RowOffsetStructuredSpinningLidarModelParametersExt>> &lidar_coeffs,
-    const at::optional<c10::intrusive_ptr<extdist::BivariateWindshieldModelParameters>> &external_distortion_params
+    const at::optional<c10::intrusive_ptr<extdist::BivariateWindshieldModelParameters>> &external_distortion_params,
+    const at::optional<at::Tensor> velocities, // [..., N, 3] optional
+    const bool lidar_phase_modeling
 )
 {
     DEVICE_GUARD(means);
@@ -1943,6 +1945,14 @@ ProjectionUT3DGSFusedResult projection_ut_3dgs_fused_impl(
     {
         CHECK_INPUT(opacities.value());
     }
+    if(velocities.has_value())
+    {
+        CHECK_INPUT(velocities.value());
+    }
+    TORCH_CHECK(
+        !lidar_phase_modeling || camera_model == CameraModelType::LIDAR,
+        "lidar_phase_modeling requires the lidar camera model"
+    );
     CHECK_INPUT(viewmats0);
     if(viewmats1.has_value())
     {
@@ -1984,6 +1994,14 @@ ProjectionUT3DGSFusedResult projection_ut_3dgs_fused_impl(
         at::DimVector scales_shape(batch_dims);
         scales_shape.append({N, 3});
         TORCH_CHECK(scales.sizes() == scales_shape, "scales must have shape [..., N, 3], got ", scales.sizes());
+        if(velocities.has_value())
+        {
+            TORCH_CHECK(
+                velocities.value().sizes() == means.sizes(),
+                "velocities must have shape [..., N, 3], got ",
+                velocities.value().sizes()
+            );
+        }
         if(opacities.has_value())
         {
             at::DimVector opacities_shape(batch_dims);
@@ -2071,20 +2089,22 @@ ProjectionUT3DGSFusedResult projection_ut_3dgs_fused_impl(
 
     auto opt = means.options();
 
+    const int64_t n_slots = lidar_phase_modeling ? 2 * static_cast<int64_t>(N) : static_cast<int64_t>(N);
+
     at::DimVector radii_shape(batch_dims);
-    radii_shape.append({C, N, 2});
+    radii_shape.append({C, n_slots, 2});
     at::Tensor radii = at::empty(radii_shape, opt.dtype(at::kInt));
 
     at::DimVector means2d_shape(batch_dims);
-    means2d_shape.append({C, N, 2});
+    means2d_shape.append({C, n_slots, 2});
     at::Tensor means2d = at::empty(means2d_shape, opt);
 
     at::DimVector depths_shape(batch_dims);
-    depths_shape.append({C, N});
+    depths_shape.append({C, n_slots});
     at::Tensor depths = at::empty(depths_shape, opt);
 
     at::DimVector conics_shape(batch_dims);
-    conics_shape.append({C, N, 3});
+    conics_shape.append({C, n_slots, 3});
     at::Tensor conics = at::empty(conics_shape, opt);
 
     at::Tensor compensations;
@@ -2092,7 +2112,7 @@ ProjectionUT3DGSFusedResult projection_ut_3dgs_fused_impl(
     {
         // we dont want NaN to appear in this tensor, so we zero intialize it
         at::DimVector compensations_shape(batch_dims);
-        compensations_shape.append({C, N});
+        compensations_shape.append({C, n_slots});
         compensations = at::zeros(compensations_shape, opt);
     }
 
@@ -2102,6 +2122,7 @@ ProjectionUT3DGSFusedResult projection_ut_3dgs_fused_impl(
         quats,
         scales,
         opacities,
+        velocities,
         viewmats0,
         viewmats1,
         Ks,
@@ -2122,6 +2143,7 @@ ProjectionUT3DGSFusedResult projection_ut_3dgs_fused_impl(
         ftheta_coeffs,
         lidar_coeffs,
         external_distortion_params,
+        lidar_phase_modeling,
         // outputs
         radii,
         means2d,
@@ -2164,7 +2186,9 @@ ProjectionUT3DGSFusedResult projection_ut_3dgs_fused(
     const at::optional<at::Tensor> &thin_prism_coeffs, // [..., C, 4] optional
     const at::optional<c10::intrusive_ptr<FThetaCameraDistortionParameters>> &ftheta_coeffs,
     const at::optional<c10::intrusive_ptr<RowOffsetStructuredSpinningLidarModelParametersExt>> &lidar_coeffs,
-    const at::optional<c10::intrusive_ptr<extdist::BivariateWindshieldModelParameters>> &external_distortion_params
+    const at::optional<c10::intrusive_ptr<extdist::BivariateWindshieldModelParameters>> &external_distortion_params,
+    const at::optional<at::Tensor> &velocities, // [..., N, 3] optional
+    bool lidar_phase_modeling
 )
 {
 #if !GSPLAT_BUILD_3DGUT
@@ -2195,7 +2219,9 @@ ProjectionUT3DGSFusedResult projection_ut_3dgs_fused(
         thin_prism_coeffs,
         ftheta_coeffs,
         lidar_coeffs,
-        external_distortion_params
+        external_distortion_params,
+        velocities,
+        lidar_phase_modeling
     );
 #endif // !GSPLAT_BUILD_3DGUT
 }

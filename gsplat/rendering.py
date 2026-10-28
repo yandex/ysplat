@@ -317,6 +317,9 @@ def rasterization(
         int
     ] = None,  # Currently only None or 3 is accepted.
     renderer_config: Optional[RendererConfig] = None,
+    velocities: Optional[Tensor] = None,  # [..., N, 3]
+    rays_time: Optional[Tensor] = None,  # [..., C, H, W]
+    lidar_phase_modeling: bool = False,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
@@ -708,6 +711,9 @@ def rasterization(
         renderer_config_impl,
         process_group_name,
         world_size,
+        velocities.contiguous() if velocities is not None else None,
+        rays_time.contiguous() if rays_time is not None else None,
+        lidar_phase_modeling,
     )
 
     if absgrad and not with_eval3d:

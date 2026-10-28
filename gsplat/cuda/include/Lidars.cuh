@@ -65,6 +65,13 @@ struct RowOffsetStructuredSpinningLidarModelParametersExtDevice
     const glm::ivec2 *tiles_to_elements_map;
 };
 
+enum class LidarPhase : int
+{
+    CENTER = 0,
+    EARLY  = 1,
+    LATE   = 2,
+};
+
 // Lidar camera model for spinning lidar sensors (e.g., Hesai Pandar128, AT128)
 // TODO: Create a proper LidarModel hierarchy.
 struct RowOffsetStructuredSpinningLidarModel
@@ -127,6 +134,13 @@ public:
         // Compute relative angles (within sensor FOV)
         const auto [rel_elevation, rel_azimuth] = this->relative_sensor_angles(elevation, azimuth);
 
+        return this->relative_angles_to_frame_time(rel_elevation, rel_azimuth);
+    }
+
+    __device__ float relative_angles_to_frame_time(float rel_elevation, float rel_azimuth) const
+    {
+        const RowOffsetStructuredSpinningLidarModelParametersExtDevice &lidar = parameters.lidar;
+
         // Compute the index into the map and clamp it to valid range
         const int ihoriz = static_cast<int>(
             std::clamp<float>(rel_azimuth / lidar.map_resolution_rad.x + 0.5f, 0, lidar.map_dim.x - 1)
@@ -145,6 +159,123 @@ public:
 
         // Normalize to [0, 1] range (relative frame time)
         return static_cast<float>(column_idx) / (lidar.n_columns - 1);
+    }
+
+    struct PhasePointReturn
+    {
+        glm::fvec2 phase_point;
+        bool valid_flag;
+        float relative_frame_time;
+        bool resolved = true;
+    };
+
+    __device__ auto camera_ray_to_phase_point(const glm::fvec3 &cam_ray, LidarPhase phase, float margin_factor) const
+        -> PhasePointReturn
+    {
+        const RowOffsetStructuredSpinningLidarModelParametersExtDevice &lidar = parameters.lidar;
+
+        const float ray_length = glm::length(cam_ray);
+        if(ray_length < 1e-6f)
+        {
+            return {
+                {0.f, 0.f},
+                false,
+                0.f
+            };
+        }
+
+        const glm::fvec3 ray_normalized = cam_ray / ray_length;
+        const float elevation           = std::asin(std::clamp(ray_normalized.z, -1.f, 1.f));
+        const float azimuth             = std::atan2(ray_normalized.y, ray_normalized.x);
+
+        const auto [rel_elevation, rel_azimuth] = this->relative_sensor_angles(elevation, azimuth);
+
+        const float tol_azimuth   = margin_factor * lidar.fov_horiz_rad.span;
+        const float tol_elevation = margin_factor * lidar.fov_vert_rad.span;
+
+        const bool valid = rel_elevation >= -tol_elevation
+                        && rel_elevation <= lidar.fov_vert_rad.span + tol_elevation
+                        && rel_azimuth <= lidar.fov_horiz_rad.span + tol_azimuth;
+
+        float phase_azimuth = rel_azimuth;
+        if(phase == LidarPhase::EARLY && rel_azimuth >= PI)
+        {
+            phase_azimuth -= 2.f * PI;
+        }
+        else if(phase == LidarPhase::LATE && rel_azimuth < PI)
+        {
+            phase_azimuth += 2.f * PI;
+        }
+
+        const float frame_time  = this->relative_angles_to_frame_time(rel_elevation, rel_azimuth);
+        const float time_offset = phase == LidarPhase::CENTER ? 0.f : rintf(phase_azimuth / (2.f * PI) - frame_time);
+        return {
+            {phase_azimuth * lidar.ANGLE_TO_PIXEL_SCALING_FACTOR, elevation * lidar.ANGLE_TO_PIXEL_SCALING_FACTOR},
+            valid,
+            frame_time + time_offset
+        };
+    }
+
+    template<size_t N_ROLLING_SHUTTER_ITERATIONS = 10>
+    __device__ auto world_point_to_phase_point_shutter_pose(
+        const glm::fvec3 &world_point,
+        const glm::fvec3 &world_velocity,
+        const RollingShutterParameters &rolling_shutter_parameters,
+        LidarPhase phase,
+        float margin_factor,
+        float max_time_residual,
+        const QuaternionSlerper<true> &slerper
+    ) const -> PhasePointReturn
+    {
+        const auto &rs       = rolling_shutter_parameters;
+        PhasePointReturn proj = {};
+        float projected_time = 0.f;
+        if(phase == LidarPhase::CENTER)
+        {
+            const glm::fvec3 t_mid = 0.5f * rs.t_start + 0.5f * rs.t_end;
+            const glm::fquat q_mid = precise_normalize(slerper(0.5f));
+            proj                   = this->camera_ray_to_phase_point(
+                glm::rotate(q_mid, world_point + 0.5f * world_velocity) + t_mid, phase, margin_factor
+            );
+            projected_time = 0.5f;
+        }
+        if(phase == LidarPhase::EARLY || (phase == LidarPhase::CENTER && !proj.valid_flag))
+        {
+            proj = this->camera_ray_to_phase_point(
+                glm::rotate(rs.q_start, world_point) + rs.t_start, phase, margin_factor
+            );
+            projected_time = 0.f;
+        }
+        if(phase == LidarPhase::LATE || (phase == LidarPhase::CENTER && !proj.valid_flag))
+        {
+            const PhasePointReturn proj_end = this->camera_ray_to_phase_point(
+                glm::rotate(rs.q_end, world_point + world_velocity) + rs.t_end, phase, margin_factor
+            );
+            if(phase == LidarPhase::CENTER && !proj_end.valid_flag)
+            {
+                return {proj_end.phase_point, false, 1.f};
+            }
+            proj           = proj_end;
+            projected_time = 1.f;
+        }
+
+        for(auto j = 0; j < N_ROLLING_SHUTTER_ITERATIONS; ++j)
+        {
+            const float relative_frame_time = proj.relative_frame_time;
+            if(relative_frame_time == projected_time)
+            {
+                break;
+            }
+            projected_time        = relative_frame_time;
+            const glm::fvec3 t_rs = (1.f - relative_frame_time) * rs.t_start + relative_frame_time * rs.t_end;
+            const glm::fquat q_rs = precise_normalize(slerper(relative_frame_time));
+            proj                  = this->camera_ray_to_phase_point(
+                glm::rotate(q_rs, world_point + relative_frame_time * world_velocity) + t_rs, phase, margin_factor
+            );
+        }
+
+        const bool resolved = std::fabs(projected_time - proj.relative_frame_time) <= max_time_residual;
+        return {proj.phase_point, proj.valid_flag, projected_time, resolved};
     }
 
     __device__ auto camera_ray_to_image_point(const glm::fvec3 &cam_ray, float margin_factor) const ->
@@ -326,6 +457,101 @@ struct ProjectionUTCodegenTraits<RowOffsetStructuredSpinningLidarModel>
         return 1u;
     }
 };
+
+struct LidarPhaseGaussianReturn
+{
+    glm::fvec2 mean;
+    glm::fmat2 covariance;
+    bool valid;
+    float center_relative_frame_time;
+    float azimuth_extent;
+    bool resolved = true;
+};
+
+inline __device__ auto lidar_gaussian_to_phase_gaussian_unscented_transform(
+    const RowOffsetStructuredSpinningLidarModel &lidar_model,
+    const RollingShutterParameters &rolling_shutter_parameters,
+    const UnscentedTransformParameters &unscented_transform_parameters,
+    const glm::fvec3 &gaussian_world_mean,
+    const glm::fvec3 &gaussian_world_scale,
+    const glm::fquat &gaussian_world_rot,
+    const glm::fvec3 &gaussian_world_velocity,
+    LidarPhase phase,
+    float max_time_residual
+) -> LidarPhaseGaussianReturn
+{
+    const auto [lambda, sigma_points] = world_gaussian_sigma_points(
+        unscented_transform_parameters, gaussian_world_mean, gaussian_world_scale, gaussian_world_rot
+    );
+
+    bool valid            = unscented_transform_parameters.require_all_sigma_points_valid;
+    bool resolved         = true;
+    auto phase_points     = std::array<glm::fvec2, 2 * UnscentedTransformParameters::D + 1>{};
+    auto phase_mean       = glm::fvec2{0};
+    auto phase_covariance = glm::fmat2{0};
+    auto center_time      = 0.5f;
+    auto azimuth_min      = std::numeric_limits<float>::max();
+    auto azimuth_max      = -std::numeric_limits<float>::max();
+
+    auto [mean, covariance, rest] = ut_weights(unscented_transform_parameters, lambda);
+
+    const QuaternionSlerper<true> slerper(rolling_shutter_parameters.q_start, rolling_shutter_parameters.q_end);
+    for(auto i = 0u; i < std::size(phase_points); ++i)
+    {
+        const auto [phase_point, point_valid, point_frame_time, point_resolved]
+            = lidar_model.world_point_to_phase_point_shutter_pose<>(
+                sigma_points.points[i],
+                gaussian_world_velocity,
+                rolling_shutter_parameters,
+                phase,
+                unscented_transform_parameters.in_image_margin_factor,
+                max_time_residual,
+                slerper
+            );
+        if(i == 0)
+        {
+            center_time = point_frame_time;
+        }
+
+        if(!std::isfinite(phase_point.x) || !std::isfinite(phase_point.y))
+        {
+            return {phase_mean, phase_covariance, false, center_time, 0.f};
+        }
+        resolved &= point_resolved;
+
+        if(unscented_transform_parameters.require_all_sigma_points_valid)
+        {
+            valid &= point_valid;
+            if(!point_valid)
+            {
+                return {phase_mean, phase_covariance, false, center_time, 0.f};
+            }
+        }
+        else
+        {
+            valid |= point_valid;
+        }
+        phase_points[i]  = phase_point;
+        phase_mean      += mean * phase_point;
+        mean             = rest;
+        azimuth_min      = fminf(azimuth_min, phase_point.x);
+        azimuth_max      = fmaxf(azimuth_max, phase_point.x);
+    }
+
+    if(!valid)
+    {
+        return {phase_mean, phase_covariance, false, center_time, 0.f};
+    }
+
+    for(auto i = 0u; i < std::size(phase_points); ++i)
+    {
+        const auto phase_mean_vec  = phase_points[i] - phase_mean;
+        phase_covariance          += covariance * glm::outerProduct(phase_mean_vec, phase_mean_vec);
+        covariance                 = rest;
+    }
+
+    return {phase_mean, phase_covariance, valid, center_time, azimuth_max - azimuth_min, resolved};
+}
 
 // Type list of all lidar model types
 using LidarModelTypes               = TypeList<RowOffsetStructuredSpinningLidarModel>;

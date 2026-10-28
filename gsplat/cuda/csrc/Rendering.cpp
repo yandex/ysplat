@@ -582,6 +582,42 @@ namespace
         return rays.value().expand(expected_shape).contiguous();
     }
 
+    at::optional<at::Tensor> expand_rays_time_for_3dgs(
+        const at::optional<at::Tensor> &rays_time,
+        const at::Tensor &means,
+        const at::Tensor &viewmats,
+        int64_t image_height,
+        int64_t image_width
+    )
+    {
+        if(!rays_time.has_value())
+        {
+            return c10::nullopt;
+        }
+
+        const int64_t batch_ndim = means.dim() - 2;
+        std::vector<int64_t> expected_shape;
+        expected_shape.reserve(batch_ndim + 3);
+        for(int64_t dim = 0; dim < batch_ndim; ++dim)
+        {
+            expected_shape.push_back(means.size(dim));
+        }
+        expected_shape.insert(expected_shape.end(), {viewmats.size(batch_ndim), image_height, image_width});
+        return rays_time.value().expand(expected_shape).contiguous();
+    }
+
+    at::Tensor fold_phase_slots(const at::Tensor &slots, const at::Tensor &primary_valid, int64_t slot_dim, int64_t N)
+    {
+        const at::Tensor primary   = slots.narrow(slot_dim, 0, N);
+        const at::Tensor secondary = slots.narrow(slot_dim, N, N);
+        at::Tensor mask            = primary_valid;
+        while(mask.dim() < primary.dim())
+        {
+            mask = mask.unsqueeze(-1);
+        }
+        return at::where(mask, primary, secondary).contiguous();
+    }
+
     std::vector<int64_t> batch_shape_with(const at::Tensor &means, std::initializer_list<int64_t> suffix)
     {
         std::vector<int64_t> shape;
@@ -812,10 +848,22 @@ Rasterization3DGSResult rasterization_3dgs(
     bool return_normals,
     int64_t renderer_config,
     const at::optional<std::string> &process_group_name,
-    int64_t world_size
+    int64_t world_size,
+    const at::optional<at::Tensor> &velocities,
+    const at::optional<at::Tensor> &rays_time,
+    bool lidar_phase_modeling
 )
 {
     DEVICE_GUARD(means);
+
+    TORCH_CHECK(
+        !velocities.has_value() || (with_ut && with_eval3d), "velocities require with_ut=True and with_eval3d=True"
+    );
+    TORCH_CHECK(!rays_time.has_value() || rays.has_value(), "rays_time requires rays");
+    TORCH_CHECK(
+        !lidar_phase_modeling || (with_ut && lidar_coeffs.has_value()),
+        "lidar_phase_modeling requires with_ut=True and lidar_coeffs"
+    );
 
     // A non-empty process-group name selects the multi-GPU distributed path.
     // Input validation, including distributed-mode rejection, lives in
@@ -871,6 +919,10 @@ Rasterization3DGSResult rasterization_3dgs(
     const int64_t I                            = B * C;
     at::optional<at::Tensor> projection_covars = normalize_covars_for_3dgs(covars);
     at::optional<at::Tensor> raster_rays       = expand_rays_for_3dgs(rays, means, viewmats, image_height, image_width);
+    at::optional<at::Tensor> raster_rays_time
+        = expand_rays_time_for_3dgs(rays_time, means, viewmats, image_height, image_width);
+    at::optional<at::Tensor> contiguous_velocities
+        = velocities.has_value() ? at::optional<at::Tensor>(velocities.value().contiguous()) : c10::nullopt;
 
     // Seam A (distributed): all-gather cameras so this rank projects its local
     // Gaussians against every rank's cameras. `C` becomes the global camera count
@@ -905,6 +957,9 @@ Rasterization3DGSResult rasterization_3dgs(
     at::Tensor depths;
     at::Tensor conics;
     at::Tensor compensations;
+    at::Tensor phase_radii;
+    at::Tensor phase_means2d;
+    at::Tensor phase_depths;
 
     // --- Project Gaussians to 2D -----------------------------------------
     // Project Gaussians to 2D. The packed branch returns sparse visible-Gaussian
@@ -940,7 +995,9 @@ Rasterization3DGSResult rasterization_3dgs(
                 thin_prism_coeffs,
                 ftheta_coeffs,
                 lidar_coeffs,
-                external_distortion_params
+                external_distortion_params,
+                contiguous_velocities,
+                lidar_phase_modeling
             );
         }();
         radii   = projection.radii;
@@ -950,6 +1007,22 @@ Rasterization3DGSResult rasterization_3dgs(
         if(projection.compensations.has_value())
         {
             compensations = projection.compensations.value();
+        }
+        if(lidar_phase_modeling)
+        {
+            const int64_t slot_dim         = batch_ndim + 1;
+            phase_radii                    = radii;
+            phase_means2d                  = means2d;
+            phase_depths                   = depths;
+            const at::Tensor primary_valid = radii.narrow(slot_dim, 0, N).gt(0).all(-1);
+            radii   = at::maximum(radii.narrow(slot_dim, 0, N), radii.narrow(slot_dim, N, N)).contiguous();
+            means2d = fold_phase_slots(means2d, primary_valid, slot_dim, N);
+            depths  = fold_phase_slots(depths, primary_valid, slot_dim, N);
+            conics  = fold_phase_slots(conics, primary_valid, slot_dim, N);
+            if(compensations.defined())
+            {
+                compensations = fold_phase_slots(compensations, primary_valid, slot_dim, N);
+            }
         }
         batch_ids    = empty_like_indices(means);
         camera_ids   = empty_like_indices(means);
@@ -1320,9 +1393,9 @@ Rasterization3DGSResult rasterization_3dgs(
 
     // --- Identify intersecting tiles -------------------------------------
     // Contiguity is kept close to the kernels that require compact inputs.
-    at::Tensor kernel_means2d                    = means2d.contiguous();
-    at::Tensor kernel_radii                      = radii.contiguous();
-    at::Tensor kernel_depths                     = depths.contiguous();
+    at::Tensor kernel_means2d                    = lidar_phase_modeling ? phase_means2d : means2d.contiguous();
+    at::Tensor kernel_radii                      = lidar_phase_modeling ? phase_radii : radii.contiguous();
+    at::Tensor kernel_depths                     = lidar_phase_modeling ? phase_depths : depths.contiguous();
     at::Tensor kernel_conics                     = conics.contiguous();
     at::Tensor kernel_opacities                  = projected_opacities.contiguous();
     at::optional<at::Tensor> kernel_image_ids    = contiguous_optional(image_ids);
@@ -1357,6 +1430,17 @@ Rasterization3DGSResult rasterization_3dgs(
                                                                                   true, // sort
                                                                                   segmented
                                                                               );
+
+    if(lidar_phase_modeling)
+    {
+        const at::Tensor flatten_ids_long = isects.flatten_ids.to(at::kLong);
+        const at::Tensor image_index      = at::floor_divide(flatten_ids_long, 2 * N);
+        const at::Tensor gaussian_index   = at::remainder(at::remainder(flatten_ids_long, 2 * N), N);
+        isects.flatten_ids                = (image_index * N + gaussian_index).to(at::kInt);
+        const int64_t slot_dim            = isects.tiles_per_gauss.dim() - 1;
+        isects.tiles_per_gauss
+            = isects.tiles_per_gauss.narrow(slot_dim, 0, N) + isects.tiles_per_gauss.narrow(slot_dim, N, N);
+    }
 
     at::Tensor isect_offsets
         = call_torch_op<&intersect_offset>("gsplat::intersect_offset", isects.isect_ids, I, tile_width, tile_height);
@@ -1419,7 +1503,9 @@ Rasterization3DGSResult rasterization_3dgs(
                 renderer_config,
                 false, // return_last_ids
                 false, // unsafe_masked_tile_outputs (safe default: masked tiles write defined outputs)
-                return_depth_dispersion && start == 0
+                return_depth_dispersion && start == 0,
+                contiguous_velocities,
+                raster_rays_time
             );
             render_color_chunks.push_back(raster.renders);
             if(!render_alphas.defined())

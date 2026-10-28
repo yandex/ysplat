@@ -1155,8 +1155,9 @@ TORCH_LIBRARY(gsplat, m)
         "__torch__.torch.classes.gsplat.RowOffsetStructuredSpinningLidarModelParametersExt? lidar_coeffs, "
         "__torch__.torch.classes.gsplat.BivariateWindshieldModelParameters? external_distortion_params, bool "
         "global_z_order, bool return_depth_dispersion, bool use_hit_distance, bool return_normals, int renderer_config, "
-        "str? process_group_name, int world_size) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, "
-        "Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, int, int)"
+        "str? process_group_name, int world_size, Tensor? velocities=None, Tensor? rays_time=None, bool "
+        "lidar_phase_modeling=False) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, "
+        "Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, int, int)"
     );
 #endif
 
@@ -1235,8 +1236,8 @@ TORCH_LIBRARY(gsplat, m)
         "Tensor? tangential_coeffs, Tensor? thin_prism_coeffs, "
         "__torch__.torch.classes.gsplat.FThetaCameraDistortionParameters? ftheta_coeffs, "
         "__torch__.torch.classes.gsplat.RowOffsetStructuredSpinningLidarModelParametersExt? lidar_coeffs, "
-        "__torch__.torch.classes.gsplat.BivariateWindshieldModelParameters? external_distortion_params) -> (Tensor, "
-        "Tensor, Tensor, Tensor, Tensor?)"
+        "__torch__.torch.classes.gsplat.BivariateWindshieldModelParameters? external_distortion_params, Tensor? "
+        "velocities=None, bool lidar_phase_modeling=False) -> (Tensor, Tensor, Tensor, Tensor, Tensor?)"
     );
     m.def(
         "rasterize_to_pixels_from_world_3dgs(Tensor means, Tensor quats, Tensor scales, Tensor colors, Tensor "
@@ -1249,7 +1250,8 @@ TORCH_LIBRARY(gsplat, m)
         "__torch__.torch.classes.gsplat.BivariateWindshieldModelParameters? external_distortion_params, Tensor "
         "tile_offsets, Tensor flatten_ids, bool return_sample_counts, bool use_hit_distance, bool return_normals, int "
         "renderer_config, bool return_last_ids, bool unsafe_masked_tile_outputs=False, bool "
-        "return_depth_dispersion=False) -> (Tensor, Tensor, Tensor?, Tensor?, Tensor?, Tensor?)"
+        "return_depth_dispersion=False, Tensor? velocities=None, Tensor? rays_time=None) -> (Tensor, Tensor, Tensor?, "
+        "Tensor?, Tensor?, Tensor?)"
     );
 
 #if GSPLAT_BUILD_3DGS

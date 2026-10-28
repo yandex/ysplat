@@ -239,7 +239,9 @@ ProjectionUT3DGSFusedResult projection_ut_3dgs_fused(
     const at::optional<at::Tensor> &thin_prism_coeffs,
     const at::optional<c10::intrusive_ptr<FThetaCameraDistortionParameters>> &ftheta_coeffs,
     const at::optional<c10::intrusive_ptr<RowOffsetStructuredSpinningLidarModelParametersExt>> &lidar_coeffs,
-    const at::optional<c10::intrusive_ptr<extdist::BivariateWindshieldModelParameters>> &external_distortion_params
+    const at::optional<c10::intrusive_ptr<extdist::BivariateWindshieldModelParameters>> &external_distortion_params,
+    const at::optional<at::Tensor> &velocities,
+    bool lidar_phase_modeling
 );
 
 void launch_projection_ewa_simple_fwd_kernel(
@@ -540,9 +542,10 @@ void launch_projection_ut_3dgs_fused_kernel(
     // inputs
     const at::Tensor means,                   // [N, 3]
     const at::Tensor quats,                   // [N, 4]
-    const at::Tensor scales,                  // [N, 3]
-    const at::optional<at::Tensor> opacities, // [N] optional
-    const at::Tensor viewmats0,               // [C, 4, 4]
+    const at::Tensor scales,                   // [N, 3]
+    const at::optional<at::Tensor> opacities,  // [N] optional
+    const at::optional<at::Tensor> velocities, // [N, 3] optional
+    const at::Tensor viewmats0,                // [C, 4, 4]
     const at::optional<at::Tensor> viewmats1, // [C, 4, 4] optional for rolling shutter
     const at::Tensor Ks,                      // [C, 3, 3]
     const uint32_t image_width,
@@ -564,6 +567,7 @@ void launch_projection_ut_3dgs_fused_kernel(
     const at::optional<c10::intrusive_ptr<RowOffsetStructuredSpinningLidarModelParametersExt>> &lidar_coeffs,
     const at::optional<c10::intrusive_ptr<extdist::BivariateWindshieldModelParameters>>
         &external_distortion_params, // external distortion parameters
+    const bool lidar_phase_modeling,
     // outputs
     at::Tensor radii,                      // [C, N, 2]
     at::Tensor means2d,                    // [C, N, 2]

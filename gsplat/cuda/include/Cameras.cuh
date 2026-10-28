@@ -459,6 +459,13 @@ struct BaseCameraModel
         bool valid_flag;
     };
 
+    struct ImagePointTimeReturn
+    {
+        glm::fvec2 imagePoint;
+        bool valid_flag;
+        float relative_frame_time;
+    };
+
     // Apply external distortion before camera projection (forward)
     inline __device__ auto camera_ray_to_image_point(const glm::fvec3 &cam_ray, float margin_factor) const
         -> ImagePointReturn
@@ -554,6 +561,22 @@ struct BaseCameraModel
         QuaternionSlerper<UsePrecomputedSlerper> precomputed_slerper = {}
     ) const -> ImagePointReturn
     {
+        const auto [image_point, valid, relative_frame_time]
+            = world_point_to_image_point_shutter_pose_moving<N_ROLLING_SHUTTER_ITERATIONS, UsePrecomputedSlerper>(
+                world_point, glm::fvec3{0.f}, rolling_shutter_parameters, margin_factor, precomputed_slerper
+            );
+        return {image_point, valid};
+    }
+
+    template<size_t N_ROLLING_SHUTTER_ITERATIONS = 10, bool UsePrecomputedSlerper = false>
+    inline __device__ auto world_point_to_image_point_shutter_pose_moving(
+        const glm::fvec3 &world_point,
+        const glm::fvec3 &world_velocity,
+        const RollingShutterParameters &rolling_shutter_parameters,
+        float margin_factor,
+        QuaternionSlerper<UsePrecomputedSlerper> precomputed_slerper = {}
+    ) const -> ImagePointTimeReturn
+    {
         // Perform rolling-shutter-based world point to image point projection /
         // optimization
 
@@ -573,26 +596,30 @@ struct BaseCameraModel
             // Exit early if we have a global shutter sensor
             return {
                 {image_point_start.x, image_point_start.y},
-                valid_start
+                valid_start,
+                0.f
             };
         }
 
         // Do initial transformations using both start and end poses to
         // determine all candidate points and take union of valid projections as
         // iteration starting points
-        const auto [image_point_end, valid_end]
-            = derived->camera_ray_to_image_point(glm::rotate(q_end, world_point) + t_end, margin_factor);
+        const auto [image_point_end, valid_end] = derived->camera_ray_to_image_point(
+            glm::rotate(q_end, world_point + world_velocity) + t_end, margin_factor
+        );
 
         // This selection prefers points at the start-of-frame pose over
         // end-of-frame points
-        auto init_image_point = glm::fvec2{};
+        auto init_image_point     = glm::fvec2{};
+        auto projected_frame_time = 0.f;
         if(valid_start)
         {
             init_image_point = image_point_start;
         }
         else if(valid_end)
         {
-            init_image_point = image_point_end;
+            init_image_point     = image_point_end;
+            projected_frame_time = 1.f;
         }
         else
         {
@@ -600,7 +627,8 @@ struct BaseCameraModel
             // Still return projection result at end of frame
             return {
                 {image_point_end.x, image_point_end.y},
-                false
+                false,
+                1.f
             };
         }
 
@@ -639,16 +667,19 @@ struct BaseCameraModel
             // pose updates, so use the precise normalization here.
             q_rs = precise_normalize(slerper(relative_frame_time));
 
-            const auto [image_point_rs, valid_rs]
-                = derived->camera_ray_to_image_point(glm::rotate(q_rs, world_point) + t_rs, margin_factor);
+            const auto [image_point_rs, valid_rs] = derived->camera_ray_to_image_point(
+                glm::rotate(q_rs, world_point + relative_frame_time * world_velocity) + t_rs, margin_factor
+            );
 
             image_points_rs_prev = image_point_rs;
             valid                = valid_rs;
+            projected_frame_time = relative_frame_time;
         }
 
         return {
             {image_points_rs_prev.x, image_points_rs_prev.y},
-            valid
+            valid,
+            projected_frame_time
         };
     }
 };
@@ -1913,6 +1944,7 @@ struct ImageGaussianReturn
     glm::fvec2 mean;
     glm::fmat2 covariance;
     bool valid;
+    float center_relative_frame_time;
 };
 
 template<class CameraModel>
@@ -1922,7 +1954,8 @@ inline __device__ auto world_gaussian_to_image_gaussian_unscented_transform_shut
     const UnscentedTransformParameters &unscented_transform_parameters,
     const glm::fvec3 &gaussian_world_mean,
     const glm::fvec3 &gaussian_world_scale,
-    const glm::fquat &gaussian_world_rot
+    const glm::fquat &gaussian_world_rot,
+    const glm::fvec3 &gaussian_world_velocity = glm::fvec3{0.f}
 ) -> ImageGaussianReturn
 {
     // Compute sigma points for input distribution
@@ -1936,6 +1969,7 @@ inline __device__ auto world_gaussian_to_image_gaussian_unscented_transform_shut
     auto image_points     = std::array<glm::fvec2, 2 * UnscentedTransformParameters::D + 1>{};
     auto image_mean       = glm::fvec2{0};
     auto image_covariance = glm::fmat2{0};
+    auto center_time      = 0.5f;
 
     auto [mean, covariance, rest] = ut_weights(unscented_transform_parameters, lambda);
 
@@ -1963,15 +1997,20 @@ inline __device__ auto world_gaussian_to_image_gaussian_unscented_transform_shut
 #pragma unroll kUTUnroll
     for(auto i = 0u; i < std::size(image_points); ++i)
     {
-        typename CameraModel::ImagePointReturn image_point_return{};
-        image_point_return = camera_model.template world_point_to_image_point_shutter_pose<>(
+        typename CameraModel::ImagePointTimeReturn image_point_return{};
+        image_point_return = camera_model.template world_point_to_image_point_shutter_pose_moving<>(
             sigma_points.points[i],
+            gaussian_world_velocity,
             rolling_shutter_parameters,
             unscented_transform_parameters.in_image_margin_factor,
             rs_slerper
         );
 
-        const auto [image_point, point_valid] = image_point_return;
+        const auto [image_point, point_valid, point_frame_time] = image_point_return;
+        if(i == 0)
+        {
+            center_time = point_frame_time;
+        }
 
         if(unscented_transform_parameters.require_all_sigma_points_valid)
         {
@@ -1979,7 +2018,7 @@ inline __device__ auto world_gaussian_to_image_gaussian_unscented_transform_shut
             if(!point_valid)
             {
                 // Early exit if invalid
-                return {image_mean, image_covariance, false};
+                return {image_mean, image_covariance, false, center_time};
             }
         }
         else
@@ -1994,7 +2033,7 @@ inline __device__ auto world_gaussian_to_image_gaussian_unscented_transform_shut
     if(!valid)
     {
         // Early exit if invalid
-        return {image_mean, image_covariance, false};
+        return {image_mean, image_covariance, false, center_time};
     }
 
 #pragma unroll kUTUnroll
@@ -2005,7 +2044,7 @@ inline __device__ auto world_gaussian_to_image_gaussian_unscented_transform_shut
         covariance                 = rest;
     }
 
-    return {image_mean, image_covariance, valid};
+    return {image_mean, image_covariance, valid, center_time};
 }
 
 // ---------------------------------------------------------------------------

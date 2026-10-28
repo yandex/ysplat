@@ -2408,7 +2408,9 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
     const at::optional<at::Tensor> sample_counts, // [..., C, image_height, image_width] optional
     const at::optional<at::Tensor> normals,       // [..., C, image_height, image_width, 3] optional output tensor
     const bool unsafe_masked_tile_outputs,
-    const bool return_depth_dispersion
+    const bool return_depth_dispersion,
+    const at::optional<at::Tensor> velocities, // [..., N, 3]
+    const at::optional<at::Tensor> rays_time   // [..., C, H, W]
 )
 {
 #if !GSPLAT_BUILD_3DGUT
@@ -2599,6 +2601,27 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
             "spherical camera model does not support camera distortion"
         );
     }
+    if(velocities.has_value())
+    {
+        CHECK_INPUT(velocities.value());
+        TORCH_CHECK_VALUE(
+            velocities.value().sizes() == means.sizes(),
+            "velocities must have shape [*batch, N, 3], got ",
+            velocities.value().sizes()
+        );
+        TORCH_CHECK_VALUE(
+            rays.has_value() && rays_time.has_value(), "velocities require explicit rays and rays_time"
+        );
+    }
+    if(rays_time.has_value())
+    {
+        CHECK_INPUT(rays_time.value());
+        TORCH_CHECK_VALUE(
+            rays.has_value() && rays_time.value().sizes() == rays.value().sizes().slice(0, rays.value().dim() - 1),
+            "rays_time must have shape rays.shape[:-1], got ",
+            rays_time.value().sizes()
+        );
+    }
 
     TORCH_CHECK_VALUE(
         tile_size == 8u || tile_size == 16u, "3DGUT rasterization requires tile_size in (8, 16), got ", tile_size
@@ -2686,6 +2709,10 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
     // batch-parallel implementation.
     const RendererConfig effective_renderer_config
         = return_depth_dispersion ? RendererConfig::MIXED_BATCH : renderer_config;
+    TORCH_CHECK_VALUE(
+        !velocities.has_value() || effective_renderer_config == RendererConfig::MIXED_BATCH,
+        "velocities are only supported by the MixedBatch renderer"
+    );
     const bool needs_batch_state = !fwd_only || effective_renderer_config == RendererConfig::PARALLEL_BATCH;
 
     // --- Build CSR batch structure + forward persistence buffer -----------
@@ -2739,6 +2766,7 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
             means,
             quats,
             scales,
+            velocities,
             colors,
             opacities,
             backgrounds,
@@ -2753,6 +2781,7 @@ RasterizeToPixelsFromWorld3DGSFwdResult rasterize_to_pixels_from_world_3dgs_fwd(
             ut_params,
             rs_type,
             rays,
+            rays_time,
             radial_coeffs,
             tangential_coeffs,
             thin_prism_coeffs,
@@ -2939,6 +2968,7 @@ namespace
         at::Tensor v_opacities;
         at::Tensor v_backgrounds;
         at::optional<at::Tensor> v_rays;
+        at::optional<at::Tensor> v_velocities;
     };
 
     // Gradients of the differentiable forward outputs.
@@ -2964,6 +2994,8 @@ namespace
         const at::optional<at::Tensor> &viewmats1,
         const at::Tensor &Ks,
         const at::optional<at::Tensor> &rays,
+        const at::optional<at::Tensor> &rays_time,
+        const at::optional<at::Tensor> &velocities,
         const at::optional<at::Tensor> &radial_coeffs,
         const at::optional<at::Tensor> &tangential_coeffs,
         const at::optional<at::Tensor> &thin_prism_coeffs,
@@ -3078,12 +3110,16 @@ namespace
         at::Tensor v_opacities = at::zeros_like(opacities);
         at::optional<at::Tensor> v_rays
             = rays.has_value() ? at::optional<at::Tensor>(at::zeros_like(rays.value())) : at::optional<at::Tensor>();
+        at::optional<at::Tensor> v_velocities = velocities.has_value()
+                                                  ? at::optional<at::Tensor>(at::zeros_like(velocities.value()))
+                                                  : at::optional<at::Tensor>();
 
         // --- Launch batch-parallel backward kernel ------------------------
         launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
             means,
             quats,
             scales,
+            velocities,
             colors,
             opacities,
             backgrounds,
@@ -3098,6 +3134,7 @@ namespace
             ut_params,
             rs_type,
             rays,
+            rays_time,
             radial_coeffs,
             tangential_coeffs,
             thin_prism_coeffs,
@@ -3125,7 +3162,8 @@ namespace
             v_scales,
             v_colors,
             v_opacities,
-            v_rays
+            v_rays,
+            v_velocities
         );
 
         // --- Compute background gradient ----------------------------------
@@ -3147,6 +3185,7 @@ namespace
             .v_opacities   = v_opacities,
             .v_backgrounds = v_backgrounds,
             .v_rays        = v_rays,
+            .v_velocities  = v_velocities,
         };
     }
 
@@ -3192,6 +3231,8 @@ namespace
                 RETURN_LAST_IDS,
                 UNSAFE_MASKED_TILE_OUTPUTS,
                 RETURN_DEPTH_DISPERSION,
+                VELOCITIES,
+                RAYS_TIME,
                 COUNT,
             };
         };
@@ -3252,7 +3293,9 @@ namespace
             int64_t renderer_config,
             bool return_last_ids,
             bool unsafe_masked_tile_outputs,
-            bool return_depth_dispersion
+            bool return_depth_dispersion,
+            const at::optional<at::Tensor> &velocities, // [..., N, 3]
+            const at::optional<at::Tensor> &rays_time   // [..., C, H, W]
         )
         {
             static_assert(
@@ -3313,7 +3356,9 @@ namespace
                 optional_outputs.sample_counts,
                 optional_outputs.normals,
                 unsafe_masked_tile_outputs,
-                return_depth_dispersion
+                return_depth_dispersion,
+                velocities,
+                rays_time
             );
 
             // --- Save state for backward --------------------------------------
@@ -3333,6 +3378,8 @@ namespace
                 viewmats1,
                 Ks,
                 rays,
+                rays_time,
+                velocities,
                 radial_coeffs,
                 tangential_coeffs,
                 thin_prism_coeffs,
@@ -3411,6 +3458,7 @@ namespace
             grads[FwdInput::OPACITIES]   = g.v_opacities;
             grads[FwdInput::BACKGROUNDS] = g.v_backgrounds;
             grads[FwdInput::RAYS]        = as_tensor(g.v_rays);
+            grads[FwdInput::VELOCITIES]  = as_tensor(g.v_velocities);
             return grads;
         }
 
@@ -3449,7 +3497,9 @@ namespace
             int64_t renderer_config,
             bool return_last_ids,
             bool unsafe_masked_tile_outputs,
-            bool return_depth_dispersion
+            bool return_depth_dispersion,
+            const at::optional<at::Tensor> &velocities,
+            const at::optional<at::Tensor> &rays_time
         )
         {
             torch::autograd::variable_list outputs = apply(
@@ -3484,7 +3534,9 @@ namespace
                 renderer_config,
                 return_last_ids,
                 unsafe_masked_tile_outputs,
-                return_depth_dispersion
+                return_depth_dispersion,
+                velocities,
+                rays_time
             );
             return {
                 .renders  = outputs[FwdOutput::RENDERS],
@@ -3545,7 +3597,9 @@ RasterizeToPixelsFromWorld3DGSResult rasterize_to_pixels_from_world_3dgs(
     int64_t renderer_config,
     bool return_last_ids,
     bool unsafe_masked_tile_outputs,
-    bool return_depth_dispersion
+    bool return_depth_dispersion,
+    const at::optional<at::Tensor> &velocities, // [..., N, 3]
+    const at::optional<at::Tensor> &rays_time   // [..., C, H, W]
 )
 {
 #if !GSPLAT_BUILD_3DGUT
@@ -3568,7 +3622,9 @@ RasterizeToPixelsFromWorld3DGSResult rasterize_to_pixels_from_world_3dgs(
         tangential_coeffs,
         thin_prism_coeffs,
         tile_offsets,
-        flatten_ids
+        flatten_ids,
+        velocities,
+        rays_time
     );
 
     if(!use_custom_autograd)
@@ -3614,7 +3670,9 @@ RasterizeToPixelsFromWorld3DGSResult rasterize_to_pixels_from_world_3dgs(
             optional_outputs.sample_counts,
             optional_outputs.normals,
             unsafe_masked_tile_outputs,
-            return_depth_dispersion
+            return_depth_dispersion,
+            velocities,
+            rays_time
         );
         return {
             .renders       = fwd.renders,
@@ -3658,7 +3716,9 @@ RasterizeToPixelsFromWorld3DGSResult rasterize_to_pixels_from_world_3dgs(
         renderer_config,
         return_last_ids,
         unsafe_masked_tile_outputs,
-        return_depth_dispersion
+        return_depth_dispersion,
+        velocities,
+        rays_time
     );
 #endif // !GSPLAT_BUILD_3DGUT
 }

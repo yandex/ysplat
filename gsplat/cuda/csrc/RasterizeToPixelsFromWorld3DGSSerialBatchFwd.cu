@@ -72,6 +72,7 @@ __global__ void
         const vec3 *__restrict__ means,        // [B, N, 3]
         const vec4 *__restrict__ quats,        // [B, N, 4]
         const vec3 *__restrict__ scales,       // [B, N, 3]
+        const vec3 *__restrict__ velocities,   // [B, N, 3] optional
         const float *__restrict__ colors,      // [B, C, N, CDIM] or [nnz, CDIM]
         const float *__restrict__ opacities,   // [B, C, N] or [nnz]
         const float *__restrict__ backgrounds, // [B, C, CDIM]
@@ -87,6 +88,7 @@ __global__ void
         const UnscentedTransformParameters ut_params,
         const ShutterType rs_type,
         const float *__restrict__ rays,              // [B, C, H, W, 6]
+        const float *__restrict__ rays_time,         // [B, C, H, W] optional
         const float *__restrict__ radial_coeffs,     // [B, C, 6] or [B, C, 4] optional
         const float *__restrict__ tangential_coeffs, // [B, C, 2] optional
         const float *__restrict__ thin_prism_coeffs, // [B, C, 4] optional
@@ -276,6 +278,10 @@ __global__ void
     {
         rays += iid * image_height * image_width * 6;
     }
+    if(rays_time != nullptr)
+    {
+        rays_time += iid * image_height * image_width;
+    }
 
     // Rolling shutter parameter (loop-invariant across pixel slots)
     auto rs_params
@@ -283,6 +289,7 @@ __global__ void
 
     vec3 ray_o[PIXELS_PER_THREAD] = {};
     vec3 ray_d[PIXELS_PER_THREAD] = {};
+    float ray_t[PIXELS_PER_THREAD] = {};
 #    pragma unroll
     for(uint32_t p = 0; p < PIXELS_PER_THREAD; ++p)
     {
@@ -319,6 +326,10 @@ __global__ void
         {
             ray_o[p] = ray.ray_org;
             ray_d[p] = ray.ray_dir;
+            if(rays_time != nullptr)
+            {
+                ray_t[p] = rays_time[pc[p].pix_id];
+            }
         }
     }
 
@@ -384,6 +395,8 @@ __global__ void
     mat3 *iscl_rot_batch    = reinterpret_cast<mat3 *>(&xyz_opacity_batch[FETCH_SIZE]); // [FETCH_SIZE]
     vec3 *scale_batch       = reinterpret_cast<vec3 *>(&iscl_rot_batch[FETCH_SIZE]);    // [FETCH_SIZE]
     vec3 *normal_batch      = reinterpret_cast<vec3 *>(&scale_batch[FETCH_SIZE]);       // [FETCH_SIZE]
+    vec3 *velocity_batch
+        = velocities != nullptr ? reinterpret_cast<vec3 *>(&normal_batch[FETCH_SIZE]) : nullptr; // [FETCH_SIZE]
 
     // Per-pixel state
     int32_t cur_idx[PIXELS_PER_THREAD];
@@ -463,6 +476,9 @@ __global__ void
             // Per-pixel rays and accumulation state.
             ray_o,
             ray_d,
+            ray_t,
+            velocities,
+            velocity_batch,
             ALL_DONE,
             transmittance_threshold,
             T,
@@ -594,6 +610,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_impl(
     const at::Tensor means,                     // [..., N, 3]
     const at::Tensor quats,                     // [..., N, 4]
     const at::Tensor scales,                    // [..., N, 3]
+    const at::optional<at::Tensor> velocities,  // [..., N, 3]
     const at::Tensor colors,                    // [..., C, N, channels] or [nnz, channels]
     const at::Tensor opacities,                 // [..., C, N] or [nnz]
     const at::optional<at::Tensor> backgrounds, // [..., C, channels]
@@ -611,6 +628,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_impl(
     const c10::intrusive_ptr<UnscentedTransformParameters> &ut_params,
     ShutterType rs_type,
     const at::optional<at::Tensor> rays,              // [...., C, H, W, 6]
+    const at::optional<at::Tensor> rays_time,         // [...., C, H, W]
     const at::optional<at::Tensor> radial_coeffs,     // [..., C, 6] or [..., C, 4] optional
     const at::optional<at::Tensor> tangential_coeffs, // [..., C, 2] optional
     const at::optional<at::Tensor> thin_prism_coeffs, // [..., C, 4] optional
@@ -729,7 +747,13 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_impl(
         const dim3 grid    = {I, grid_h, grid_w};
         // Shared memory: id_batch + xyz_opacity_batch + iscl_rot_batch + scale_batch + normal_batch
         const int64_t shmem_size
-            = CTA_SIZE * (sizeof(int32_t) + sizeof(vec4) + sizeof(mat3) + sizeof(vec3) + sizeof(vec3));
+            = CTA_SIZE
+            * (sizeof(int32_t)
+               + sizeof(vec4)
+               + sizeof(mat3)
+               + sizeof(vec3)
+               + sizeof(vec3)
+               + (velocities.has_value() ? sizeof(vec3) : 0));
 
         if(cudaFuncSetAttribute(
                rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel<
@@ -763,6 +787,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_impl(
             data_ptr_as<const vec3, float>(means),
             data_ptr_as<const vec4, float>(quats),
             data_ptr_as<const vec3, float>(scales),
+            velocities.has_value() ? data_ptr_as<const vec3, float>(velocities.value()) : nullptr,
             colors.const_data_ptr<float>(),
             opacities.const_data_ptr<float>(),
             data_ptr_or_null<const float>(backgrounds),
@@ -777,6 +802,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_impl(
             *ut_params,
             rs_type,
             data_ptr_or_null<const float>(rays),
+            data_ptr_or_null<const float>(rays_time),
             data_ptr_or_null<const float>(radial_coeffs),
             data_ptr_or_null<const float>(tangential_coeffs),
             data_ptr_or_null<const float>(thin_prism_coeffs),
@@ -814,6 +840,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel(
     const at::Tensor means,                     // [..., N, 3]
     const at::Tensor quats,                     // [..., N, 4]
     const at::Tensor scales,                    // [..., N, 3]
+    const at::optional<at::Tensor> velocities,  // [..., N, 3]
     const at::Tensor colors,                    // [..., C, N, channels] or [nnz, channels]
     const at::Tensor opacities,                 // [..., C, N] or [nnz]
     const at::optional<at::Tensor> backgrounds, // [..., C, channels]
@@ -831,6 +858,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel(
     const c10::intrusive_ptr<UnscentedTransformParameters> &ut_params,
     ShutterType rs_type,
     const at::optional<at::Tensor> rays,              // [...., C, H, W, 6]
+    const at::optional<at::Tensor> rays_time,         // [...., C, H, W]
     const at::optional<at::Tensor> radial_coeffs,     // [..., C, 6] or [..., C, 4] optional
     const at::optional<at::Tensor> tangential_coeffs, // [..., C, 2] optional
     const at::optional<at::Tensor> thin_prism_coeffs, // [..., C, 4] optional
@@ -862,6 +890,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel(
         means,
         quats,
         scales,
+        velocities,
         colors,
         opacities,
         backgrounds,
@@ -876,6 +905,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel(
         ut_params,
         rs_type,
         rays,
+        rays_time,
         radial_coeffs,
         tangential_coeffs,
         thin_prism_coeffs,

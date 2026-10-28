@@ -574,7 +574,9 @@ __device__ __forceinline__ void cooperative_load_fetch_round(
     const vec3 *__restrict__ scales,
     const scalar_t *__restrict__ opacities,
     const uint32_t C,
-    const uint32_t N
+    const uint32_t N,
+    const vec3 *__restrict__ velocities,
+    vec3 *__restrict__ velocity_batch
 )
 {
     // FETCH_SIZE_T > CTA_SIZE_T would leave shared-memory slots in
@@ -625,6 +627,10 @@ __device__ __forceinline__ void cooperative_load_fetch_round(
         mat3 S              = mat3(1.0f / scale[0], 0.f, 0.f, 0.f, 1.0f / scale[1], 0.f, 0.f, 0.f, 1.0f / scale[2]);
         iscl_rot_batch[tid] = S * glm::transpose(R);
         scale_batch[tid]    = scale;
+        if(velocity_batch != nullptr)
+        {
+            velocity_batch[tid] = velocities[isect_bid * N + isect_gid];
+        }
 
         // Normal = R * (0, 0, 1) = third column of R.
         if constexpr(ReturnNormals)
@@ -676,6 +682,8 @@ __device__ __forceinline__ void process_fetch_round_blend(
     const scalar_t *__restrict__ colors,
     const vec3 (&ray_o)[PIXELS_PER_THREAD_T],
     const vec3 (&ray_d)[PIXELS_PER_THREAD_T],
+    const float (&ray_t)[PIXELS_PER_THREAD_T],
+    const vec3 *__restrict__ velocity_batch,
     const uint32_t ALL_DONE,
     const float (&transmittance_threshold)[PIXELS_PER_THREAD_T],
     float (&T)[PIXELS_PER_THREAD_T],
@@ -701,6 +709,7 @@ __device__ __forceinline__ void process_fetch_round_blend(
         const vec3 xyz      = {xyz_opac[0], xyz_opac[1], xyz_opac[2]};
         const mat3 iscl_rot = iscl_rot_batch[t];
         const vec3 scale    = scale_batch[t];
+        const vec3 velocity = velocity_batch != nullptr ? velocity_batch[t] : vec3(0.f);
 
 #pragma unroll
         for(uint32_t p = 0; p < PIXELS_PER_THREAD_T; ++p)
@@ -710,7 +719,8 @@ __device__ __forceinline__ void process_fetch_round_blend(
                 continue;
             }
 
-            const vec3 gro    = iscl_rot * (ray_o[p] - xyz);
+            const vec3 xyz_p  = velocity_batch != nullptr ? xyz + velocity * ray_t[p] : xyz;
+            const vec3 gro    = iscl_rot * (ray_o[p] - xyz_p);
             const vec3 grd    = safe_normalize(iscl_rot * ray_d[p]);
             // hit_t < 0: closest approach is behind the camera origin — skip.
             const float hit_t = -glm::dot(grd, gro);
@@ -854,6 +864,9 @@ __device__ __forceinline__ bool process_logical_batch_gaussians(
     const uint32_t N,
     const vec3 (&ray_o)[PIXELS_PER_THREAD_T],
     const vec3 (&ray_d)[PIXELS_PER_THREAD_T],
+    const float (&ray_t)[PIXELS_PER_THREAD_T],
+    const vec3 *__restrict__ velocities,
+    vec3 *__restrict__ velocity_batch,
     const uint32_t ALL_DONE,
     const float (&transmittance_threshold)[PIXELS_PER_THREAD_T],
     float (&T)[PIXELS_PER_THREAD_T],
@@ -911,7 +924,9 @@ __device__ __forceinline__ bool process_logical_batch_gaussians(
             scales,
             opacities,
             C,
-            N
+            N,
+            velocities,
+            velocity_batch
         );
 
         cta_sync<CTA_SIZE_T>();
@@ -935,6 +950,8 @@ __device__ __forceinline__ bool process_logical_batch_gaussians(
           colors,
           ray_o,
           ray_d,
+          ray_t,
+          velocity_batch,
           ALL_DONE,
           transmittance_threshold,
           T,

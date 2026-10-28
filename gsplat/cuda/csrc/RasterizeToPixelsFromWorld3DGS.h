@@ -37,6 +37,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel(
     const at::Tensor means,                     // [..., N, 3]
     const at::Tensor quats,                     // [..., N, 4]
     const at::Tensor scales,                    // [..., N, 3]
+    const at::optional<at::Tensor> velocities,  // [..., N, 3]
     const at::Tensor colors,                    // [..., C, N, channels] or [nnz, channels]
     const at::Tensor opacities,                 // [..., C, N]  or [nnz]
     const at::optional<at::Tensor> backgrounds, // [..., C, channels]
@@ -54,6 +55,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_serial_batch_fwd_kernel(
     const c10::intrusive_ptr<UnscentedTransformParameters> &ut_params,
     ShutterType rs_type,
     const at::optional<at::Tensor> rays,                                       // [..., C, H, W, 6]
+    const at::optional<at::Tensor> rays_time,                                  // [..., C, H, W]
     const at::optional<at::Tensor> radial_coeffs,                              // [..., C, 6] or [..., C, 4] optional
     const at::optional<at::Tensor> tangential_coeffs,                          // [..., C, 2] optional
     const at::optional<at::Tensor> thin_prism_coeffs,                          // [..., C, 4] optional
@@ -137,6 +139,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
     const at::Tensor means,                     // [..., N, 3]
     const at::Tensor quats,                     // [..., N, 4]
     const at::Tensor scales,                    // [..., N, 3]
+    const at::optional<at::Tensor> velocities,  // [..., N, 3]
     const at::Tensor colors,                    // [..., C, N, channels] or [nnz, channels]
     const at::Tensor opacities,                 // [..., C, N] or [nnz]
     const at::optional<at::Tensor> backgrounds, // [..., C, channels]
@@ -154,6 +157,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
     const c10::intrusive_ptr<UnscentedTransformParameters> &ut_params,
     ShutterType rs_type,
     const at::optional<at::Tensor> rays,                                       // [..., C, H, W, 6]
+    const at::optional<at::Tensor> rays_time,                                  // [..., C, H, W]
     const at::optional<at::Tensor> radial_coeffs,                              // [..., C, 6] or [..., C, 4] optional
     const at::optional<at::Tensor> tangential_coeffs,                          // [..., C, 2] optional
     const at::optional<at::Tensor> thin_prism_coeffs,                          // [..., C, 4] optional
@@ -189,6 +193,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
     at::Tensor v_scales,            // [..., N, 3]
     at::Tensor v_colors,            // [..., C, N, 3] or [nnz, 3]
     at::Tensor v_opacities,         // [..., C, N] or [nnz]
-    at::optional<at::Tensor> v_rays // [..., C, image_height, image_width, 6]
+    at::optional<at::Tensor> v_rays, // [..., C, image_height, image_width, 6]
+    at::optional<at::Tensor> v_velocities // [..., N, 3]
 );
 } // namespace gsplat
