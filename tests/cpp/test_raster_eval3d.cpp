@@ -315,8 +315,10 @@ private:
             c10::nullopt, // thin_prism_coeffs
             ftheta_coeffs,
             c10::nullopt, // lidar_coeffs
-            c10::nullopt
-        ); // external_distortion_params
+            c10::nullopt, // external_distortion_params
+            c10::nullopt,
+            false
+        );
         const at::Tensor &radii   = projection.radii;
         const at::Tensor &means2d = projection.means2d;
         const at::Tensor &depths  = projection.depths;
