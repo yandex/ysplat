@@ -1271,13 +1271,6 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_bwd_kernel(
                 "fwd_depth_moment_state has wrong shape"
             );
         }
-        TORCH_CHECK(
-            fwd_batch_state.numel() <= INT32_MAX,
-            "ParallelBatch fwd_batch_state exceeds signed 32-bit device "
-            "offset range (",
-            fwd_batch_state.numel(),
-            " elements)"
-        );
         const bool use_compose_stop = compose_c_stop.defined();
         if(use_compose_stop)
         {

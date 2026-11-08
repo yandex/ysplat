@@ -193,7 +193,7 @@ protected:
     }
 
 private:
-    static __device__ int32_t slot_base_offset(int32_t slot, int32_t pixels_per_tile)
+    static __device__ int64_t slot_base_offset(int32_t slot, int32_t pixels_per_tile)
     {
         assert(slot >= 0);
         assert(pixels_per_tile > 0);
@@ -201,8 +201,8 @@ private:
         assert(state_dim <= INT32_MAX / pixels_per_tile);
         const int32_t slot_stride = state_dim * pixels_per_tile;
         assert(slot_stride > 0);
-        assert(slot <= INT32_MAX / slot_stride);
-        return slot * slot_stride;
+        assert(slot <= INT64_MAX / slot_stride);
+        return static_cast<int64_t>(slot) * slot_stride;
     }
 
     scalar_t *slot_base_;

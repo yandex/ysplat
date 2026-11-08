@@ -1632,13 +1632,6 @@ void launch_rasterize_to_pixels_from_world_3dgs_parallel_batch_fwd_kernel(
                 && fwd_batch_state.size(2) == pixels_per_tile,
             "fwd_batch_state has wrong shape"
         );
-        TORCH_CHECK(
-            fwd_batch_state.numel() <= INT32_MAX,
-            "ParallelBatch fwd_batch_state exceeds signed 32-bit device "
-            "offset range (",
-            fwd_batch_state.numel(),
-            " elements)"
-        );
 
         TORCH_CHECK(
             partials_meta.dim() == 3
