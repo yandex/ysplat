@@ -682,8 +682,14 @@ def compute_angles_to_columns_map(
     lidar: RowOffsetStructuredSpinningLidarModelParameters,
     resolution_factor: float = 4,
     dtype: torch.dtype = torch.int32,
+    *,
+    num_threads: int = 1,
 ):
-    """Computes angles to column map as a 2D array of shape resolution_factor * (n_rows, n_columns)."""
+    """Compute the angle-to-column map of shape resolution_factor * (n_rows, n_columns).
+
+    ``num_threads`` controls the number of CPU threads used to query the KD-tree.
+    Pass ``-1`` to use all CPU threads.
+    """
 
     # The idea here is to create a regular high-resolution grid spanning the whole FOV
     # and store in each grid cell the projected azimuth of the closest lidar ray to it.
@@ -732,6 +738,7 @@ def compute_angles_to_columns_map(
         columns,
         resolution_factor=resolution_factor,
         dtype=dtype,
+        num_threads=num_threads,
     )
 
 

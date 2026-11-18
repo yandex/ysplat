@@ -214,7 +214,9 @@ def test_values_map_with_column_values_equals_columns_map(num_threads):
     via_values = compute_angles_to_values_map(
         p, rays, columns, resolution_factor=4, num_threads=num_threads
     )
-    direct = compute_angles_to_columns_map(p, resolution_factor=4)
+    direct = compute_angles_to_columns_map(
+        p, resolution_factor=4, num_threads=num_threads
+    )
     assert torch.equal(via_values.cpu(), direct.cpu())
 
 
