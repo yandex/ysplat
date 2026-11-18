@@ -153,7 +153,7 @@ def get_extras_require() -> dict:
     return {
         # lidar dependencies. Install them by `pip install gsplat[lidar]`
         "lidar": [
-            "scipy",
+            "scipy>=1.6",
         ],
         # examples / tutorial dependencies. The dynamic-surgical trainer and
         # the EndoNeRF parser/dataset import these at module top, but they

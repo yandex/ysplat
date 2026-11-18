@@ -625,11 +625,16 @@ def compute_angles_to_values_map(
     values: Tensor,
     resolution_factor: float = 4,
     dtype: torch.dtype = torch.int32,
+    *,
+    num_threads: int = 1,
 ):
     """Generalization of ``compute_angles_to_columns_map``: computes a 2D map of
     shape resolution_factor * (n_rows, n_columns) spanning the FOV, where each
     grid cell stores ``values[i]`` of the nearest (L^2 over unit rays) element
-    ray ``i``
+    ray ``i``.
+
+    ``num_threads`` controls the number of CPU threads used to query the KD-tree.
+    Pass ``-1`` to use all CPU threads.
     """
     assert (
         element_rays.ndim == 2 and element_rays.shape[-1] == 3
@@ -661,7 +666,9 @@ def compute_angles_to_values_map(
     kdtree = scipy_spatial.cKDTree(
         element_rays.contiguous().cpu().numpy()
     )  # ty:ignore[unresolved-attribute]
-    _, idxs = kdtree.query(grid_rays.reshape(-1, 3).contiguous().cpu().numpy())
+    _, idxs = kdtree.query(
+        grid_rays.reshape(-1, 3).contiguous().cpu().numpy(), workers=num_threads
+    )
     idxs = torch.from_numpy(idxs)
 
     return (

@@ -205,12 +205,15 @@ def test_columns_map_matches_prepatch_reference(make_params):
 # --------------------------------------------------------------------------
 
 
-def test_values_map_with_column_values_equals_columns_map():
+@pytest.mark.parametrize("num_threads", [1, 2])
+def test_values_map_with_column_values_equals_columns_map(num_threads):
     p = _make_params()
     ideal = _ideal_element_angles(p).reshape(-1, 2)
     rays = sensor_angles_to_rays(p, ideal).sensor_rays
     columns = torch.arange(ideal.shape[0], dtype=torch.int64) % p.n_columns
-    via_values = compute_angles_to_values_map(p, rays, columns, resolution_factor=4)
+    via_values = compute_angles_to_values_map(
+        p, rays, columns, resolution_factor=4, num_threads=num_threads
+    )
     direct = compute_angles_to_columns_map(p, resolution_factor=4)
     assert torch.equal(via_values.cpu(), direct.cpu())
 
